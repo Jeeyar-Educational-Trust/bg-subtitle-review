@@ -92,13 +92,15 @@ it changed nothing, so check those terms by ear.
 |---|---|
 | Telugu `.sbv` / `.srt` | The (human-corrected) Telugu subtitles, in the formats ticked on upload |
 | English `.srt` / `.sbv` | Final English: the human correction where given, else the AI draft. Sanskrit terms marked `*like this*` become `<i>italics</i>` in SRT (SBV has no styling) |
-| `*_master_review.xlsx` | Cue #, timecode, Telugu, AI English, Human Review Correction; an **AI Review** sheet when that pass was run |
+| `*_master_review.xlsx` | Cue #, timecode, Telugu, Human Review Correction, AI English; an **AI Review** sheet when that pass was run |
 | `*_discourse_brief.md` | Context the model builds before translating |
 | `*_translation_raw.json` | Machine-readable translations |
 
-Jobs and their files are kept **24 hours** after upload (`RETENTION_HOURS`), are
+Jobs and their files are kept **7 days** after upload (`RETENTION_HOURS`, default 168), are
 listed under *Recent jobs*, survive server restarts, and are then deleted
-automatically. A job can also be deleted immediately from its page.
+automatically. A job can also be deleted immediately from its page. The window is
+measured from each job's upload time, so changing `RETENTION_HOURS` (and restarting)
+also lengthens or shortens jobs that already exist.
 
 ## Cost per file
 
@@ -210,7 +212,7 @@ speech-to-text).
 
 > **Free plan caveat:** Render's free disk is wiped on every restart, deploy and
 > idle spin-down (about 15 minutes without traffic), so a job can disappear before
-> its 24 hours — download files when a job finishes. Full 24-hour retention needs a
+> its 7 days — download files when a job finishes. Full 7-day retention needs a
 > paid plan with a persistent disk (set `JOBS_DIR` to the disk's mount path). A step
 > that is running when the server restarts is marked as interrupted and can be re-run.
 
@@ -218,7 +220,7 @@ speech-to-text).
 
 The app also runs on an Azure Windows Server VM as two always-on Windows services:
 `SubtitleReview` (uvicorn) and `Caddy` (HTTPS reverse proxy). The VM's disk is
-persistent, so the full 24-hour job retention works here — unlike Render's free plan.
+persistent, so the full 7-day job retention works here — unlike Render's free plan.
 
 | | |
 |---|---|

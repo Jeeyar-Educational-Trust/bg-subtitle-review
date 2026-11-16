@@ -56,8 +56,8 @@ WORKBOOK_COLUMNS = [
     "Cue Number",
     "Timecode",
     "Telugu Cue",
+    "Human Review Correction",   # before the AI draft, so reviewers see their fixes first
     "AI Generated English Cue",
-    "Human Review Correction",
 ]
 
 # progress(message) -> None. Optional hook so callers (web UI) can show status.
@@ -696,7 +696,7 @@ def review_rows(
 # row gets an explicit height, so viewers that do not auto-fit rows (Excel web and
 # mobile, Google Sheets imports) also show the full text.
 TELUGU_FONT = "Nirmala UI"
-REVIEW_WIDTHS = {"A": 12, "B": 30, "C": 64, "D": 66, "E": 48}
+REVIEW_WIDTHS = {"A": 12, "B": 30, "C": 64, "D": 48, "E": 66}
 # (points per wrapped line, characters per line at the column width) — calibrated in Excel.
 LATIN_LINE_PT, LATIN_CHARS_PER_WIDTH = 15.0, 1.1
 TELUGU_LINE_PT, TELUGU_CHARS_PER_WIDTH = 17.5, 1.0
@@ -755,7 +755,7 @@ def create_workbook(rows: List[Dict[str, Any]], out_path: Path) -> None:
     _write_sheet(
         ws,
         WORKBOOK_COLUMNS,
-        [[r["cue"], f"{r['start']} --> {r['end']}", r["telugu"], r["english"], r.get("correction") or ""]
+        [[r["cue"], f"{r['start']} --> {r['end']}", r["telugu"], r.get("correction") or "", r["english"]]
          for r in rows],
         REVIEW_WIDTHS,
         telugu_cols=["C"],

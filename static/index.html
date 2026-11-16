@@ -282,7 +282,7 @@
 
       <section class="card">
         <h2>Recent jobs</h2>
-        <p class="hint" id="retentionNote" style="margin:-6px 0 12px;">Files are kept for 24 hours, then deleted automatically.</p>
+        <p class="hint" id="retentionNote" style="margin:-6px 0 12px;">Files are kept for 7 days, then deleted automatically.</p>
         <div id="jobsList" class="jobs"><p class="empty">Loading…</p></div>
       </section>
     </div>
@@ -405,7 +405,7 @@
     };
 
     let password = sessionStorage.getItem(KEY) || "";
-    let retentionHours = 24;
+    let retentionHours = 168;
     let job = null;        // public job data
     let source = [];       // [{start, end, text, confidence}]
     let rows = [];         // [{cue, start, end, telugu, english, correction, review}]
@@ -449,8 +449,11 @@
       const ms = new Date(iso) - new Date();
       if (ms <= 0) return "expired";
       const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+      if (h >= 48) return `deleted in ${Math.floor(h / 24)} days ${h % 24} h`;
       return h ? `deleted in ${h} h ${m} min` : `deleted in ${m} min`;
     }
+    const retentionText = () => retentionHours >= 48 && retentionHours % 24 === 0
+      ? `${retentionHours / 24} days` : `${retentionHours} hours`;
     const plain = (t) => String(t || "").replace(/\*/g, "");
     const currentEnglish = (r) => (r.correction || "").trim() || r.english;
     function readability(r) {
@@ -493,7 +496,7 @@
       const res = await fetch("/api/login", { method: "POST", headers: { "X-App-Password": pw } });
       if (!res.ok) return false;
       const data = await res.json();
-      retentionHours = data.retention_hours || 24;
+      retentionHours = data.retention_hours || 168;
       return true;
     }
     async function doLogin() {
@@ -515,7 +518,7 @@
     function unlocked() {
       show("loginCard", false);
       show("logoutBtn");
-      $("retentionNote").textContent = `Files are kept for ${retentionHours} hours after upload, then deleted automatically.`;
+      $("retentionNote").textContent = `Files are kept for ${retentionText()} after upload, then deleted automatically.`;
       route();
     }
     function logout() {
@@ -547,7 +550,7 @@
       try {
         const jobs = await apiJson("/api/jobs");
         list.innerHTML = "";
-        if (!jobs.length) list.append(el("p", { class: "empty" }, "No jobs in the last " + retentionHours + " hours."));
+        if (!jobs.length) list.append(el("p", { class: "empty" }, "No jobs in the last " + retentionText() + "."));
         for (const j of jobs) {
           list.append(el("button", { class: "job-item", type: "button", onclick: () => { location.hash = "job=" + j.id; } },
             el("div", {},
