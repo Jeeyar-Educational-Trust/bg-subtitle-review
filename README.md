@@ -92,7 +92,7 @@ it changed nothing, so check those terms by ear.
 |---|---|
 | Telugu `.sbv` / `.srt` | The (human-corrected) Telugu subtitles, in the formats ticked on upload |
 | English `.srt` / `.sbv` | Final English: the human correction where given, else the AI draft. Sanskrit terms marked `*like this*` become `<i>italics</i>` in SRT (SBV has no styling) |
-| `*_master_review.xlsx` | Cue #, timecode, Telugu, AI English, Human Review Correction; an **AI Review** sheet when that pass was run |
+| `*_master_review.xlsx` | Cue #, timecode, Telugu, Human Review Correction, AI English; an **AI Review** sheet when that pass was run |
 | `*_discourse_brief.md` | Context the model builds before translating |
 | `*_translation_raw.json` | Machine-readable translations |
 
