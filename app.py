@@ -12,8 +12,8 @@ Workflow (one job per upload, human in the loop at every stage):
     sbv/srt ------------->  [human edits Telugu cues] -> translate
     translate -> [human reviews English] -> optional AI review -> [human decides] -> export
 
-Jobs live on disk under jobs/<id>/ and are deleted RETENTION_HOURS (default 24)
-after creation.
+Jobs live on disk under jobs/<id>/ and are deleted RETENTION_HOURS (default 168,
+i.e. 7 days) after creation.
 
 Endpoints:
     GET    /                                -> web UI
@@ -70,7 +70,7 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024)))  # 2 MB subtitles
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(300 * 1024 * 1024)))  # 300 MB audio
-RETENTION_HOURS = float(os.getenv("RETENTION_HOURS", "24"))
+RETENTION_HOURS = float(os.getenv("RETENTION_HOURS", "168"))  # 7 days
 CLEANUP_INTERVAL_SEC = 15 * 60
 
 REVIEW_FLAGS = ("missing", "recovered", "low")  # see transcribe.build_cues
@@ -121,13 +121,16 @@ class Job:
         self.progress: List[str] = data.get("progress", [])
         self.error: Optional[str] = data.get("error")
         self.created_at: str = data.get("created_at") or _now().isoformat()
-        self.expires_at: str = data.get("expires_at") or (
-            datetime.fromisoformat(self.created_at) + timedelta(hours=RETENTION_HOURS)
-        ).isoformat()
         self.options: Dict[str, Any] = data.get("options", {})
         self.cue_count: int = data.get("cue_count", 0)
         self.has_audio: bool = data.get("has_audio", False)
         self.reviewed: bool = data.get("reviewed", False)
+
+    @property
+    def expires_at(self) -> str:
+        # Derived rather than read from job.json, so a change to RETENTION_HOURS also
+        # applies to jobs that already exist (a stored value would pin the old window).
+        return (datetime.fromisoformat(self.created_at) + timedelta(hours=RETENTION_HOURS)).isoformat()
 
     @property
     def dir(self) -> Path:
@@ -175,7 +178,7 @@ _LOCK = threading.RLock()
 
 
 def load_jobs() -> None:
-    """Rebuild the index from disk so jobs survive restarts within their 24 h."""
+    """Rebuild the index from disk so jobs survive restarts within their retention window."""
     for job_file in JOBS_DIR.glob("*/job.json"):
         data = _read_json(job_file)
         if not data:
