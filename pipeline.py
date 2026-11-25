@@ -56,7 +56,7 @@ WORKBOOK_COLUMNS = [
     "Cue Number",
     "Timecode",
     "Telugu Cue",
-    "Human Review Correction",   # before the AI draft, so reviewers see their fixes first
+    "Human Review Correction",   # the final English: the human correction, else the AI draft
     "AI Generated English Cue",
 ]
 
@@ -755,7 +755,7 @@ def create_workbook(rows: List[Dict[str, Any]], out_path: Path) -> None:
     _write_sheet(
         ws,
         WORKBOOK_COLUMNS,
-        [[r["cue"], f"{r['start']} --> {r['end']}", r["telugu"], r.get("correction") or "", r["english"]]
+        [[r["cue"], f"{r['start']} --> {r['end']}", r["telugu"], current_english(r), r["english"]]
          for r in rows],
         REVIEW_WIDTHS,
         telugu_cols=["C"],
