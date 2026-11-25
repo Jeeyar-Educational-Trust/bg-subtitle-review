@@ -270,6 +270,21 @@ def test_confirm_original_with_file(env):
     assert client.post("/api/youtube/videos/vid2/generate", headers=PW).status_code == 409
 
 
+def test_undo_original_retires_the_attached_file(env):
+    client, app_module, _ = env
+    assert client.post("/api/youtube/videos/vid2/original", data={"decision": "unknown"}, headers=PW).status_code == 200
+    v = video(client, "vid2")
+    assert v["category"] == "confirm" and v["files"] == []  # no "(original)" download on an unconfirmed video
+    dl = client.get("/api/youtube/videos/vid2/subtitles?source=youtube_original&lang=en&fmt=srt", headers=PW)
+    assert dl.status_code == 404
+    kept = app_module.db.fetchall("SELECT version, is_current FROM subtitle_files WHERE video_id = 'vid2'")
+    assert [(r["version"], r["is_current"]) for r in kept] == [(1, False)]  # kept as history
+    # Confirming again with a new file makes it version 2.
+    client.post("/api/youtube/videos/vid2/original", data={"decision": "confirmed", "reviewer": "Asha"},
+                files={"file": ("orig.srt", SRT.encode(), "text/plain")}, headers=PW)
+    assert [f["version"] for f in video(client, "vid2")["files"]] == [2]
+
+
 def test_failed_download_retry_and_manual_upload(env):
     client, _, state = env
     state["download_error"] = "YouTube refused the download from this server."
@@ -289,6 +304,9 @@ def test_failed_download_retry_and_manual_upload(env):
     drafts = eventually(lambda: (r := client.get("/api/youtube/videos/vid4/subtitles?stage=draft&lang=te&fmt=sbv",
                                                  headers=PW)).status_code == 200 and r)
     assert drafts and "భగవద్గీత" in drafts.text
+    # Unapproved drafts are offered on the dashboard too (until an approved version exists).
+    offered = {(f["language"], f["format"], f["stage"]) for f in video(client, "vid4")["files"]}
+    assert offered == {("te", "srt", "draft"), ("te", "sbv", "draft")}
 
 
 def test_manual_jobs_are_unchanged(env):
@@ -315,6 +333,15 @@ def test_schema_version_mismatch_disables_youtube(env):
         app_module.db.execute("UPDATE alembic_version SET version_num = %s", (app_module.db.EXPECTED_REVISION,))
         app_module.db.check_schema()
     assert client.get("/api/youtube/videos", headers=PW).status_code == 200
+
+
+def test_update_video_if_job_only_touches_the_current_job(env):
+    _, app_module, _ = env
+    before = app_module.db.get_video("vid1")
+    assert app_module.db.update_video("vid1", if_job="an-older-job", workflow_status="failed") == 0
+    assert app_module.db.get_video("vid1")["workflow_status"] == before["workflow_status"]
+    assert app_module.db.update_video("vid1", if_job=before["current_job_id"],
+                                      workflow_status=before["workflow_status"]) == 1
 
 
 def test_restart_marks_interrupted_videos_failed(env):

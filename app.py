@@ -60,12 +60,13 @@ import re
 import secrets
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -103,6 +104,20 @@ YOUTUBE_MAX_CONCURRENT = max(1, int(os.getenv("YOUTUBE_MAX_CONCURRENT", "1")))
 YOUTUBE_AUTO_SYNC_HOURS = float(os.getenv("YOUTUBE_AUTO_SYNC_HOURS", "0"))  # 0 = only the Sync button
 YT_SLOTS = threading.BoundedSemaphore(YOUTUBE_MAX_CONCURRENT)  # concurrent YouTube downloads
 _SYNC_LOCK = threading.Lock()
+_VIDEO_LOCKS: Dict[str, threading.Lock] = {}
+_VIDEO_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _video_lock(video_id: str):
+    """One start/rebuild at a time per playlist video. Check-then-act steps (may a job start?
+    is the job alive?) span database round trips, so without this a double-click gets two
+    requests past the same check: two downloads and two paid transcriptions, or two rebuilds
+    of one job folder."""
+    with _VIDEO_LOCKS_GUARD:
+        lock = _VIDEO_LOCKS.setdefault(video_id, threading.Lock())
+    with lock:
+        yield
 
 REVIEW_FLAGS = ("missing", "recovered", "low")  # see transcribe.build_cues
 
@@ -156,6 +171,9 @@ class Job:
         self.cue_count: int = data.get("cue_count", 0)
         self.has_audio: bool = data.get("has_audio", False)
         self.reviewed: bool = data.get("reviewed", False)
+        # Runtime only (not in job.json): a rebuilt playlist job is downloading its audio
+        # again, so the page keeps polling until the player can appear.
+        self.audio_pending: bool = False
 
     @property
     def expires_at(self) -> str:
@@ -183,6 +201,7 @@ class Job:
     def public(self) -> dict:
         data = {k: getattr(self, k) for k in self.FIELDS if k != "options"}
         data["busy"] = self.state in BUSY_STATES
+        data["audio_pending"] = self.audio_pending
         data["downloads"] = self.downloads()
         data["audio_token"] = audio_token(self.id) if self.has_audio else None
         data["youtube"] = _youtube_public(self)  # None unless the job belongs to a playlist video
@@ -335,8 +354,14 @@ def require_password(x_app_password: str = Header(default="")) -> None:
             status_code=503,
             detail="Server not configured: APP_PASSWORD is not set.",
         )
-    if not secrets.compare_digest(x_app_password, APP_PASSWORD):
+    if not _same_secret(x_app_password, APP_PASSWORD):
         raise HTTPException(status_code=401, detail="Invalid password.")
+
+
+def _same_secret(given: str, expected: str) -> bool:
+    # compare_digest raises TypeError on non-ASCII str (a header can carry any Latin-1
+    # byte), which would be a 500; comparing UTF-8 bytes makes it a plain mismatch.
+    return secrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
 def audio_token(job_id: str) -> str:
@@ -459,7 +484,7 @@ async def create_job(
     # "Upload audio instead" on the playlist dashboard links the upload to a video.
     video_id = youtube_video_id.strip()
     if video_id:
-        video = await asyncio.to_thread(_video_for_new_job, video_id)
+        await asyncio.to_thread(_video_for_new_job, video_id)  # fail fast, before the upload
         chosen = list(FORMATS)  # playlist videos always keep both formats
 
     kind = "audio" if ext in AUDIO_EXTS else "subtitle"
@@ -496,22 +521,31 @@ async def create_job(
         job.save()
 
     if video_id:
+        actor = _reviewer(x_reviewer)
+
+        def claim() -> None:
+            # Checked again under the video's lock: another job may have started during the upload.
+            with _video_lock(video_id):
+                video = _video_for_new_job(video_id)
+                _link_job(job, video, "transcribing" if kind == "audio" else "telugu_review",
+                          f"manual upload: {filename}", actor)
+                if kind == "audio":  # busy before the lock is released, so a second start sees it
+                    _start_step(job, TRANSCRIBING, FAILED, _transcribe_work(job, upload_path))
+
         try:
-            await asyncio.to_thread(
-                _link_job, job, video, "transcribing" if kind == "audio" else "telugu_review",
-                f"manual upload: {filename}", _reviewer(x_reviewer))
+            await asyncio.to_thread(claim)
         except Exception:
             with _LOCK:
                 JOBS.pop(job.id, None)
             shutil.rmtree(job.dir, ignore_errors=True)
             raise
-
-    if kind == "audio":
+        if kind == "subtitle":
+            upload_path.unlink(missing_ok=True)
+            await asyncio.to_thread(_persist, job)
+    elif kind == "audio":
         _start_step(job, TRANSCRIBING, FAILED, _transcribe_work(job, upload_path))
     else:
         upload_path.unlink(missing_ok=True)
-        if video_id:
-            await asyncio.to_thread(_persist, job)
 
     return JSONResponse(status_code=202, content=await asyncio.to_thread(job.public))
 
@@ -555,14 +589,22 @@ def save_source(job_id: str, cues: Any = Body(...), x_reviewer: str = Header(def
     if changed:  # an approved Telugu (and the English made from it) no longer matches
         _after_edit(job, telugu=True, actor=_reviewer(x_reviewer))
     _persist(job)
-    stale = job.path("review.json").exists()
-    return {"ok": True, "cue_count": len(cleaned), "translation_stale": stale}
+    return {"ok": True, "cue_count": len(cleaned), "translation_stale": _translation_stale(job)}
+
+
+def _translation_stale(job: Job) -> bool:
+    """An English draft exists, but it was translated from different Telugu than there is now."""
+    if not job.path("review.json").exists():
+        return False
+    made_from = job.options.get("translated_from")
+    # Jobs translated before translated_from was recorded: assume stale, as before.
+    return made_from != _telugu_sha(job) if made_from else True
 
 
 @app.get("/api/jobs/{job_id}/audio")
 def get_audio(job_id: str, token: str = Query("")) -> FileResponse:
     job = get_job(job_id)
-    if not APP_PASSWORD or not secrets.compare_digest(token, audio_token(job.id)):
+    if not APP_PASSWORD or not _same_secret(token, audio_token(job.id)):
         raise HTTPException(status_code=401, detail="Invalid token.")
     path = job.path("audio.mp3")
     if not path.exists():
@@ -585,37 +627,44 @@ def start_translation(
     cues = _source_cues(job)
     if not cues:
         raise HTTPException(status_code=409, detail="No cues to translate.")
-    telugu_sha = None
-    if _video_id(job):  # playlist videos: the Telugu must be approved first
+    vid = _video_id(job)
+    if vid:  # playlist videos: the Telugu must be approved first
         _require_youtube()
-        video = db.get_video(_video_id(job))
-        if video and video["current_job_id"] == job.id:
-            if not video["telugu_approved_at"]:
-                raise HTTPException(status_code=409, detail="Approve the Telugu subtitles before translating.")
-            db.clear_approvals(video["video_id"], telugu=False, english=True,
-                               actor=_reviewer(x_reviewer), reason="re-translated")
-        telugu_sha = _telugu_sha(job)
+        video = db.get_video(vid)
+        if video and video["current_job_id"] == job.id and not video["telugu_approved_at"]:
+            raise HTTPException(status_code=409, detail="Approve the Telugu subtitles before translating.")
+    telugu_sha = _telugu_sha(job)  # which Telugu this English is made from (approval and "stale" check it)
+    actor = _reviewer(x_reviewer)
     chunk_size = max(5, min(200, chunk_size))
     overlap = max(0, min(20, overlap))
-    job.options.update(chunk_size=chunk_size, overlap=overlap, model=model.strip() or None)
+    model = model.strip() or None
     back_to = job.state
 
     def work(progress: Callable[[str], None]) -> str:
         result = pipeline.translate_cues(
             cues,
             skill_text=pipeline.load_skill_text(None),
-            model=job.options["model"],
+            model=model,
             chunk_size=chunk_size,
             overlap=overlap,
             progress=progress,
         )
+        if vid:
+            # The new English replaces the approved one, so withdraw that approval now that a
+            # translation exists and before the files change. If translating failed above, or
+            # this database call fails, the old English and its approval both stay as they were.
+            video = db.get_video(vid)
+            if video and video["current_job_id"] == job.id:
+                db.clear_approvals(vid, telugu=False, english=True, actor=actor, reason="re-translated")
         job.path("brief.md").write_text(result["brief"], encoding="utf-8")
         _write_json(job.path("translation_raw.json"), result["all_items"])
         _write_json(job.path("review.json"), result["rows"])
         with _LOCK:
             job.reviewed = False
-            if telugu_sha:  # which Telugu this English was made from (approval checks it)
-                job.options["translated_from"] = telugu_sha
+            job.options["translated_from"] = telugu_sha
+            # Kept only once they produced this English (the AI review reuses the model), so a
+            # failed attempt with a mistyped deployment does not stick to the job.
+            job.options.update(chunk_size=chunk_size, overlap=overlap, model=model)
         progress("Translation done. Review the English, then download or run the optional AI review.")
         return REVIEW
 
@@ -840,14 +889,15 @@ def _persist(job: Job) -> None:
                 db.save_draft(vid, job.id, "en", fmt, pipeline.english_subtitles(review, fmt))
         status = _workflow_status(job, video)
         if status:
-            db.update_video(vid, workflow_status=status, last_error=job.error)
+            db.update_video(vid, if_job=job.id, workflow_status=status, last_error=job.error)
     except Exception as err:
         _log(f"could not save job {job.id} to the database: {err}")
 
 
-def _set_workflow(video_id: str, status: str, **fields: Any) -> None:
+def _set_workflow(video_id: str, job_id: str, status: str, **fields: Any) -> None:
+    """Move the video on, unless a newer job has replaced `job_id` meanwhile."""
     try:
-        db.update_video(video_id, workflow_status=status, **fields)
+        db.update_video(video_id, if_job=job_id, workflow_status=status, **fields)
     except Exception as err:
         _log(f"could not update {video_id}: {err}")
 
@@ -874,6 +924,9 @@ def _youtube_public(job: Job) -> Optional[dict]:
         "video_id": vid,
         "url": f"https://www.youtube.com/watch?v={vid}",
         "audio_track": job.options.get("audio_track"),
+        # Set when the player's audio was downloaded from YouTube for a job whose transcript
+        # came from an uploaded file (see _refetch_audio).
+        "player_audio": job.options.get("player_audio"),
         "english_fresh": _english_fresh(job),
     }
     try:
@@ -944,7 +997,7 @@ def _youtube_work(job: Job, video_id: str) -> Callable[[Callable[[str], None]], 
             progress("Waiting for another YouTube download to finish...")
             YT_SLOTS.acquire()
         try:
-            _set_workflow(video_id, "downloading")
+            _set_workflow(video_id, job.id, "downloading")
             progress("Fetching the original audio track from YouTube...")
             path, label, _ = youtube.download_original_audio(
                 video_id, job.dir, progress=progress, lang=YOUTUBE_AUDIO_LANG,
@@ -953,28 +1006,52 @@ def _youtube_work(job: Job, video_id: str) -> Callable[[Callable[[str], None]], 
             YT_SLOTS.release()
         with _LOCK:
             job.options["audio_track"] = label
-        _set_workflow(video_id, "transcribing", audio_track=label)
+        _set_workflow(video_id, job.id, "transcribing", audio_track=label)
         return _transcribe_work(job, path)(progress)
 
     return work
 
 
 def _refetch_audio(job: Job, video_id: str) -> None:
-    """A rebuilt job has its text but no audio: download it again for the player."""
+    """A rebuilt job has its text but no audio: download it again for the player.
+
+    The download goes to a private temporary folder, and the result is moved in only while
+    `job` is still the live job. A job deleted or rebuilt in the meantime never gets a stray
+    file, and its job.json is never overwritten by this (by then orphaned) thread."""
+    tmp = Path(tempfile.mkdtemp(prefix=".refetch-", dir=JOBS_DIR))
     try:
         with YT_SLOTS:
-            path, _label, _ = youtube.download_original_audio(
-                video_id, job.dir, lang=YOUTUBE_AUDIO_LANG, max_bytes=MAX_AUDIO_BYTES, ffmpeg=_ffmpeg_or_none())
-        transcribe.make_compact_audio(path, job.path("audio.mp3"))
-        path.unlink(missing_ok=True)
+            path, label, _ = youtube.download_original_audio(
+                video_id, tmp, lang=YOUTUBE_AUDIO_LANG, max_bytes=MAX_AUDIO_BYTES, ffmpeg=_ffmpeg_or_none())
+        transcribe.make_compact_audio(path, tmp / "audio.mp3")
         with _LOCK:
+            if JOBS.get(job.id) is not job or not job.dir.is_dir():
+                return  # deleted or rebuilt meanwhile: drop this copy
+            (tmp / "audio.mp3").replace(job.path("audio.mp3"))
             job.has_audio = True
-            job.progress.append("Audio downloaded again for the player.")
+            if job.kind == "subtitle":
+                job.options["player_audio"] = label
+                job.progress.append(f"Audio downloaded from YouTube for the player ({label}). The cues came "
+                                    f"from the uploaded subtitle file {job.filename}, so check that playback "
+                                    "lines up with them.")
+            elif not job.options.get("audio_track"):  # "Upload audio instead"
+                job.options["player_audio"] = label
+                job.progress.append(f"Audio downloaded again from YouTube for the player ({label}). The "
+                                    f"transcript was made from the uploaded file {job.filename}; if that "
+                                    "recording differs from YouTube's, check that playback lines up with the cues.")
+            else:
+                job.progress.append("Audio downloaded again for the player.")
             job.save()
     except Exception as err:
         with _LOCK:
-            job.progress.append(f"Could not download the audio again ({err}). Editing works; cue playback does not.")
-            job.save()
+            if JOBS.get(job.id) is job and job.dir.is_dir():
+                job.progress.append(f"Could not download the audio again ({err}). "
+                                    "Editing works; cue playback does not.")
+                job.save()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        with _LOCK:  # last, so "not pending" means completely finished
+            job.audio_pending = False
 
 
 def _restore_job(art: Dict[str, Any], video_id: str) -> Job:
@@ -998,6 +1075,7 @@ def _restore_job(art: Dict[str, Any], video_id: str) -> Job:
         if art.get("translation_raw") is not None:
             _write_json(job.path("translation_raw.json"), art["translation_raw"])
         job.progress.append("Rebuilt from the database after the job folder expired.")
+        job.audio_pending = True
         job.save()
         JOBS[job.id] = job
     threading.Thread(target=_refetch_audio, args=(job, video_id), daemon=True).start()
@@ -1098,12 +1176,17 @@ def _auto_sync_loop() -> None:
 def youtube_videos(_: None = Depends(require_password)) -> dict:
     _require_youtube()
     files: Dict[str, List[dict]] = {}
-    for f in db.current_subtitles(YOUTUBE_PLAYLIST_ID):
-        if f["stage"] != "draft":  # drafts are downloaded from the job page
-            files.setdefault(f["video_id"], []).append({
-                "source_type": f["source_type"], "stage": f["stage"], "language": f["language"],
-                "format": f["format"], "version": f["version"], "created_by": f["created_by"],
-                "created_at": _iso(f["created_at"])})
+    current = db.current_subtitles(YOUTUBE_PLAYLIST_ID)
+    approved = {(f["video_id"], f["language"], f["format"]) for f in current if f["stage"] == "approved"}
+    for f in current:
+        # The latest generated draft is offered too, so subtitles can be found here before anyone
+        # approves them, but only until that language/format has an approved version.
+        if f["stage"] == "draft" and (f["video_id"], f["language"], f["format"]) in approved:
+            continue
+        files.setdefault(f["video_id"], []).append({
+            "source_type": f["source_type"], "stage": f["stage"], "language": f["language"],
+            "format": f["format"], "version": f["version"], "created_by": f["created_by"],
+            "created_at": _iso(f["created_at"])})
     syncs = db.last_syncs(YOUTUBE_PLAYLIST_ID)
     videos = [_video_public(v, files.get(v["video_id"], []), syncs["ok"]) for v in db.list_videos(YOUTUBE_PLAYLIST_ID)]
     latest, ok = syncs["latest"], syncs["ok"]
@@ -1135,23 +1218,25 @@ def youtube_sync(x_reviewer: str = Header(default=""), _: None = Depends(require
 @app.post("/api/youtube/videos/{video_id}/generate")
 def youtube_generate(video_id: str, x_reviewer: str = Header(default=""),
                      _: None = Depends(require_password)) -> dict:
-    video = _video_for_new_job(video_id)
-    job = Job(id=uuid.uuid4().hex, filename=_job_filename(video["title"], video_id), kind="audio",
-              formats=list(FORMATS),
-              options={"context_hint": YOUTUBE_CONTEXT_HINT, "youtube_video_id": video_id})
-    job.dir.mkdir(parents=True)
-    with _LOCK:
-        JOBS[job.id] = job
-        job.progress.append("Queued: the original audio will be downloaded from YouTube.")
-        job.save()
-    try:
-        _link_job(job, video, "queued", None, _reviewer(x_reviewer))
-    except Exception:
+    with _video_lock(video_id):  # a double-click must not start two downloads/transcriptions
+        video = _video_for_new_job(video_id)
+        job = Job(id=uuid.uuid4().hex, filename=_job_filename(video["title"], video_id), kind="audio",
+                  formats=list(FORMATS),
+                  options={"context_hint": YOUTUBE_CONTEXT_HINT, "youtube_video_id": video_id})
+        job.dir.mkdir(parents=True)
         with _LOCK:
-            JOBS.pop(job.id, None)
-        shutil.rmtree(job.dir, ignore_errors=True)
-        raise
-    _start_step(job, TRANSCRIBING, FAILED, _youtube_work(job, video_id))
+            JOBS[job.id] = job
+            job.progress.append("Queued: the original audio will be downloaded from YouTube.")
+            job.save()
+        try:
+            _link_job(job, video, "queued", None, _reviewer(x_reviewer))
+        except Exception:
+            with _LOCK:
+                JOBS.pop(job.id, None)
+            shutil.rmtree(job.dir, ignore_errors=True)
+            raise
+        # Busy before the lock is released, so the next request's check sees a running job.
+        _start_step(job, TRANSCRIBING, FAILED, _youtube_work(job, video_id))
     return job.public()
 
 
@@ -1199,19 +1284,22 @@ def youtube_original(
 def youtube_open(video_id: str, _: None = Depends(require_password)) -> dict:
     """The video's current job, rebuilt from Neon when its folder has expired."""
     _require_youtube()
-    video = _video_or_404(video_id)
-    job_id = video["current_job_id"]
-    if not job_id:
-        raise HTTPException(status_code=404, detail="Nothing has been generated for this video yet.")
-    with _LOCK:
-        job = JOBS.get(job_id)
-        if job and not job.expired():
-            return {"job_id": job_id, "restored": False}
-    art = db.get_artifacts(job_id)
-    if not art:
-        raise HTTPException(status_code=404, detail="This video's job has expired and no saved copy was found. "
-                                                    "Generate it again.")
-    return {"job_id": _restore_job(art, video_id).id, "restored": True}
+    # Under the video's lock, a second click waits and then finds the job the first one
+    # rebuilt, instead of rebuilding it again over the first one's audio download.
+    with _video_lock(video_id):
+        video = _video_or_404(video_id)
+        job_id = video["current_job_id"]
+        if not job_id:
+            raise HTTPException(status_code=404, detail="Nothing has been generated for this video yet.")
+        with _LOCK:
+            job = JOBS.get(job_id)
+            if job and not job.expired():
+                return {"job_id": job_id, "restored": False}
+        art = db.get_artifacts(job_id)
+        if not art:
+            raise HTTPException(status_code=404, detail="This video's job has expired and no saved copy was "
+                                                        "found. Generate it again.")
+        return {"job_id": _restore_job(art, video_id).id, "restored": True}
 
 
 @app.get("/api/youtube/videos/{video_id}/subtitles")

@@ -232,6 +232,12 @@ tab tracks every video of one playlist and starts a job straight from YouTube.
    approved files) is copied to Neon after every step and edit. If its job folder has
    expired, **Open review** rebuilds it from the database and downloads the audio
    again for the player. Audio is not stored in the database.
+6. **Finding the files later.** Each row of the dashboard has download buttons for that
+   video's subtitles, straight from Neon: the latest approved version of each language
+   and format (every earlier approved version is kept too), or the latest *(draft)* while
+   none is approved yet, and the channel's file marked *(original)* when one was attached.
+   Jobs uploaded on the **Jobs** tab are not playlist videos: they are not copied to the
+   database and are deleted after 7 days, so download their files before then.
 
 | Dashboard status | Meaning |
 |---|---|

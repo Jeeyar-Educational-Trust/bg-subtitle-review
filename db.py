@@ -234,21 +234,25 @@ def videos_in_status(statuses: Sequence[str]) -> List[Dict[str, Any]]:
     return fetchall("SELECT * FROM youtube_videos WHERE workflow_status = ANY(%s)", (list(statuses),))
 
 
-def update_video(video_id: str, conn: Any = None, **fields: Any) -> None:
+def update_video(video_id: str, conn: Any = None, *, if_job: Optional[str] = None, **fields: Any) -> int:
+    """Update whitelisted columns. With if_job, only while that job is still the video's
+    current one, so a superseded job can never overwrite the newer job's status."""
     bad = set(fields) - _VIDEO_COLUMNS
     if bad:
         raise ValueError(f"Not updatable: {', '.join(sorted(bad))}")
     if "workflow_status" in fields and fields["workflow_status"] not in WORKFLOW_STATUSES:
         raise ValueError(f"Unknown workflow status {fields['workflow_status']!r}")
     if not fields:
-        return
+        return 0
     sets = ", ".join(f"{k} = %s" for k in fields)  # keys are whitelisted above
     sql = f"UPDATE youtube_videos SET {sets}, updated_at = now() WHERE video_id = %s"
     params = [*fields.values(), video_id]
+    if if_job is not None:
+        sql += " AND current_job_id = %s"
+        params.append(if_job)
     if conn is not None:
-        conn.execute(sql, params)
-    else:
-        execute(sql, params)
+        return conn.execute(sql, params).rowcount
+    return execute(sql, params)
 
 
 def log_event(video_id: Optional[str], event: str, actor: Optional[str] = None,
@@ -406,6 +410,11 @@ def set_original(video_id: str, decision: str, reviewer: str, file: Optional[Dic
         if file:
             version = _add_version(conn, video_id, "youtube_original", "original", file["language"],
                                    file["format"], file["content"], None, reviewer)
+        if decision != "confirmed":
+            # Undo / not original: a file attached to the confirmation goes with it. It stays in
+            # subtitle_files as history, but is no longer offered for download.
+            conn.execute("UPDATE subtitle_files SET is_current = FALSE WHERE video_id = %s "
+                         "AND source_type = 'youtube_original' AND is_current", (video_id,))
         conn.execute(
             "UPDATE youtube_videos SET original_status = %s, original_by = %s, original_at = now(), "
             "updated_at = now() WHERE video_id = %s",

@@ -506,6 +506,8 @@
     let reviewer = localStorage.getItem(RKEY) || "";
     let pl = null;                                   // last GET /api/youtube/videos
     let plConfirmOpen = null, plUploadFor = null;    // video_id of an open "confirm original" panel / upload
+    const plPending = new Set();  // video_ids with a request in flight: their buttons are disabled
+    const plWatch = new Map();    // video_id -> title of videos started here, to say when each is done
     const YT_BUSY = new Set(["queued", "downloading", "transcribing", "translating"]);
     const CATEGORY = {
       not_started: { label: "Not started", badge: "" },
@@ -537,6 +539,13 @@
     }
     function setMsg(id, text, kind = "") { const m = $(id); m.className = "msg " + kind; m.textContent = text || ""; }
     function show(id, on = true) { $(id).classList.toggle("hidden", !on); }
+    // Disable a button while its request runs, so a double-click sends one request, not two.
+    // `after` re-applies the button's own enabled/disabled rule once the request is done.
+    async function withButton(btn, fn, after) {
+      if (!btn || btn.disabled) return;
+      btn.disabled = true;
+      try { await fn(); } finally { btn.disabled = false; if (after) after(); }
+    }
 
     function tsToSec(ts) {
       const m = String(ts).trim().replace(",", ".").match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d{1,3})?)$/);
@@ -759,7 +768,7 @@
       source = []; rows = []; sourceDirty = reviewDirty = false;
       show("homeView", false); show("playlistView", false); show("jobView");
       $("wrap").classList.add("wide");
-      setMsg("jobMsg", "");
+      ["jobMsg", "sourceMsg", "reviewMsg"].forEach((m) => setMsg(m, ""));  // not the previous job's messages
       try {
         job = await apiJson(`/api/jobs/${id}`);
       } catch (e) {
@@ -771,7 +780,7 @@
       await loadData();
       activeTab = job.downloads.includes("workbook") ? "review" : "source";
       renderJob();
-      if (job.busy) startPolling();
+      if (job.busy || job.audio_pending) startPolling();
     }
 
     async function loadData() {
@@ -779,19 +788,27 @@
       if (job.downloads.includes("workbook") && !reviewDirty) rows = await apiJson(`/api/jobs/${job.id}/review`);
     }
 
+    // Polls while a step runs, and while a rebuilt job's audio is being downloaded again.
     function startPolling() {
       clearInterval(pollTimer);
       pollTimer = setInterval(async () => {
-        try {
-          const prev = job.state;
-          job = await apiJson(`/api/jobs/${job.id}`);
-          if (!job.busy) {
-            clearInterval(pollTimer);
-            await loadData();
-            if (prev === "translating" && job.state === "review") activeTab = "review";
-            renderJob();
-          } else renderHeader();
-        } catch (_) { /* keep polling */ }
+        const prev = job;
+        if (!prev) return clearInterval(pollTimer);
+        let next;
+        try { next = await apiJson(`/api/jobs/${prev.id}`); } catch (_) { return; /* keep polling */ }
+        if (job !== prev) return;  // the user moved to another page meanwhile
+        job = next;
+        if (job.busy) return renderHeader();
+        if (!job.audio_pending) clearInterval(pollTimer);
+        if (prev.busy) {
+          await loadData();
+          if (prev.state === "translating" && job.state === "review") activeTab = "review";
+          renderJob();
+        } else if (job.has_audio !== prev.has_audio) {
+          renderHeader(); syncPlayer();
+          // The ▶ buttons come with the cue list; don't redraw it under someone typing in a cue.
+          if (source.length && !$("cueList").contains(document.activeElement)) renderSource();
+        } else renderHeader();
       }, 2000);
     }
 
@@ -803,7 +820,9 @@
       const life = yt ? "saved in the database" : timeLeft(job.expires_at);
       $("jobMeta").replaceChildren(`${kind} · ${job.cue_count || "–"} cues · ${life}`,
         yt ? " · " : "", yt ? el("a", { href: yt.url, target: "_blank", rel: "noopener" }, "▶ YouTube source") : "",
-        yt && yt.audio_track ? ` · audio: ${yt.audio_track}` : "");
+        yt && yt.audio_track ? ` · audio: ${yt.audio_track}` : "",
+        yt && yt.player_audio ? ` · player audio from YouTube: ${yt.player_audio} (the cues came from an uploaded file)` : "",
+        job.audio_pending && !job.has_audio ? " · downloading the audio for the player…" : "");
       $("backBtn").textContent = yt ? "← Playlist" : "← All jobs";
       const p = pill(job.state, job.error);
       if (yt && job.state === "transcribing") p.lastChild.textContent = " Downloading & transcribing";
@@ -815,7 +834,11 @@
         log.textContent = job.progress.join("\n");
         log.scrollTop = log.scrollHeight;
       }
-      setMsg("jobMsg", job.error ? job.error : "", job.error ? "err" : "");
+      // A rebuilt job whose audio could not be downloaded again: say why there is no player.
+      const lastLine = job.progress[job.progress.length - 1] || "";
+      const noAudio = !job.error && !job.busy && !job.has_audio && !job.audio_pending && yt
+        && lastLine.startsWith("Could not download the audio again") ? lastLine : "";
+      setMsg("jobMsg", job.error || noAudio, job.error ? "err" : "");
       $("deleteBtn").disabled = job.busy;
       ["saveSourceBtn", "saveReviewBtn", "aiReviewBtn"].forEach((b) => { $(b).disabled = job.busy; });
       renderTranslateButton();
@@ -867,13 +890,13 @@
       if (stage === "telugu") {
         return box.append(el("span", { class: "badge warn" }, "Step 1 of 2"),
           "Check every cue against the audio, then approve the Telugu. Translation unlocks after approval.",
-          el("span", { class: "grow" }), el("button", { class: "sm", type: "button", onclick: () => approve("telugu") }, "Approve Telugu"));
+          el("span", { class: "grow" }), el("button", { class: "sm", type: "button", onclick: (e) => withButton(e.currentTarget, () => approve("telugu")) }, "Approve Telugu"));
       }
       if (!yt.telugu_approved_by) return box.append(el("span", { class: "badge warn" }, "Step 2 of 2"), "Approve the Telugu first.");
       if (!yt.english_fresh) return box.append(el("span", { class: "badge warn" }, "Step 2 of 2"),
         "This English was translated from an earlier version of the Telugu. Re-translate on the Telugu tab before approving.");
       box.append(el("span", { class: "badge warn" }, "Step 2 of 2"), "Review every English cue, then give the final approval.",
-        el("span", { class: "grow" }), el("button", { class: "sm", type: "button", onclick: () => approve("english") }, "Approve English (final)"));
+        el("span", { class: "grow" }), el("button", { class: "sm", type: "button", onclick: (e) => withButton(e.currentTarget, () => approve("english")) }, "Approve English (final)"));
     }
 
     function renderApprovals() {
@@ -894,6 +917,11 @@
     async function approve(stage) {
       const msgId = stage === "telugu" ? "sourceMsg" : "reviewMsg";
       if (needName(msgId)) return;
+      if (stage === "telugu") {
+        // Say so now rather than after the "Approve?" question (the server checks this too).
+        const blank = source.filter((c) => !String(c.text || "").trim()).length;
+        if (blank) return setMsg(msgId, `${blank} cue(s) have no text yet. Type their words or delete them before approving.`, "err");
+      }
       if (stage === "telugu" && sourceDirty && !(await saveSource())) return;
       if (stage === "english" && reviewDirty && !(await saveReview())) return;
       const question = stage === "telugu"
@@ -905,7 +933,10 @@
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage, reviewer }),
         });
         renderJob();
-        setMsg(msgId, stage === "telugu" ? "Telugu approved. You can translate now." : "English approved. This video is complete.", "ok");
+        const done = stage === "english" ? "English approved. This video is complete."
+          : job.youtube && job.youtube.english_fresh ? "Telugu approved. The English draft already matches it: review and approve it on the English tab."
+          : "Telugu approved. You can translate now.";
+        setMsg(msgId, done, "ok");
       } catch (e) { setMsg(msgId, e.message, "err"); }
     }
 
@@ -1055,7 +1086,7 @@
       await fn();
     }
 
-    $("translateBtn").addEventListener("click", async () => {
+    $("translateBtn").addEventListener("click", (ev) => withButton(ev.currentTarget, async () => {
       if (rows.length && !confirm("Re-translate? This replaces the English draft and clears saved corrections.")) return;
       if (sourceDirty && !(await saveSource())) return;
       const fd = new FormData();
@@ -1067,7 +1098,7 @@
         renderHeader(); startPolling();
         window.scrollTo({ top: 0, behavior: "smooth" });
       } catch (e) { setMsg("sourceMsg", e.message, "err"); }
-    });
+    }, () => { if (job) renderTranslateButton(); }));
 
     // ---------- review editor ----------
     function markReviewDirty() { reviewDirty = true; setMsg("reviewMsg", "Unsaved changes.", ""); }
@@ -1163,7 +1194,7 @@
     }
     $("saveReviewBtn").addEventListener("click", saveReview);
 
-    $("aiReviewBtn").addEventListener("click", async () => {
+    $("aiReviewBtn").addEventListener("click", (ev) => withButton(ev.currentTarget, async () => {
       if (!confirm("Run the AI review? It flags likely errors (accuracy, terminology, grammar, style, reading speed) and suggests fixes. Nothing changes until you choose “Use suggestion”.")) return;
       if (reviewDirty && !(await saveReview())) return;
       try {
@@ -1171,7 +1202,7 @@
         renderHeader(); startPolling();
         window.scrollTo({ top: 0, behavior: "smooth" });
       } catch (e) { setMsg("reviewMsg", e.message, "err"); }
-    });
+    }, () => { $("aiReviewBtn").disabled = !!(job && job.busy); }));
 
     // ---------- YouTube playlist dashboard ----------
     async function showPlaylist() {
@@ -1186,9 +1217,33 @@
 
     const plBusy = () => !!pl && pl.videos.some((v) => v.busy || YT_BUSY.has(v.workflow_status));
 
+    // Replace "Started …" with the outcome once a video started from this page has finished.
+    function plReportFinished() {
+      for (const [id, title] of plWatch) {
+        const v = pl.videos.find((x) => x.video_id === id);
+        if (v && v.category === "progress") continue;
+        plWatch.delete(id);
+        if (!v) continue;
+        if (v.category === "failed") setMsg("plMsg", `“${title}” failed: ${v.last_error || "open the job for details."}`, "err");
+        else setMsg("plMsg", `“${title}” is ready: its Telugu subtitles are waiting for review.`, "ok");
+      }
+    }
+
+    // Run one action for a video, with that video's buttons disabled until it is done.
+    async function plAct(v, fn) {
+      if (plPending.has(v.video_id)) return;
+      plPending.add(v.video_id);
+      if (pl) renderPlaylist();
+      try { await fn(); } finally {
+        plPending.delete(v.video_id);
+        if (pl && location.hash === "#youtube") renderPlaylist();
+      }
+    }
+
     async function loadPlaylist() {
       try {
         pl = await apiJson("/api/youtube/videos");
+        plReportFinished();
         renderPlaylist();
       } catch (e) {
         pl = null;
@@ -1204,6 +1259,7 @@
           if (location.hash !== "#youtube") return clearInterval(pollTimer);
           try {
             pl = await apiJson("/api/youtube/videos");
+            plReportFinished();
             if (!plConfirmOpen) renderPlaylist();  // don't wipe a half-filled confirm panel
             if (!plBusy()) clearInterval(pollTimer);
           } catch (_) { /* keep polling */ }
@@ -1280,7 +1336,9 @@
     }
 
     function videoActions(v) {
-      const btn = (label, fn, primary = false) => el("button", { class: primary ? "sm" : "ghost", type: "button", onclick: fn }, label);
+      const pending = plPending.has(v.video_id);
+      const btn = (label, fn, primary = false) => el("button", { class: primary ? "sm" : "ghost", type: "button",
+        disabled: pending, onclick: () => plAct(v, fn) }, label);
       const out = [];
       switch (v.category) {
         case "confirm":
@@ -1304,14 +1362,15 @@
           out.push(btn("Open review", () => openVideo(v)));
           break;
         case "original":
-          out.push(el("button", { class: "linkbtn", type: "button", title: "Undo the confirmation",
-            onclick: () => setOriginal(v, "unknown") }, "Undo"));
+          out.push(el("button", { class: "linkbtn", type: "button", title: "Undo the confirmation", disabled: pending,
+            onclick: () => plAct(v, () => setOriginal(v, "unknown")) }, "Undo"));
           break;
       }
       for (const f of v.files) {
-        const label = `${f.language === "te" ? "TE" : "EN"} .${f.format}${f.source_type === "youtube_original" ? " (original)" : ""}`;
+        const draft = f.stage === "draft";
+        const label = `${f.language === "te" ? "TE" : "EN"} .${f.format}${f.source_type === "youtube_original" ? " (original)" : draft ? " (draft)" : ""}`;
         out.push(el("button", { class: "ghost", type: "button", "aria-label": `Download ${label}, version ${f.version}`,
-          title: `Version ${f.version}${f.created_by ? `, by ${f.created_by}` : ""}`,
+          title: draft ? "Latest generated draft, not approved yet" : `Approved version ${f.version}${f.created_by ? `, by ${f.created_by}` : ""}`,
           onclick: () => download(`/api/youtube/videos/${v.video_id}/subtitles?source=${f.source_type}&stage=${f.stage}&lang=${f.language}&fmt=${f.format}`) }, "⬇ " + label));
       }
       return out;
@@ -1324,7 +1383,10 @@
       return el("div", { class: "panel" },
         "Confirm that this video's YouTube captions are original (uploaded by the channel). Optionally attach a copy:",
         file, lang,
-        el("button", { class: "sm", type: "button", onclick: () => setOriginal(v, "confirmed", file.files[0], lang.value) }, "Confirm"),
+        el("button", { class: "sm", type: "button", disabled: plPending.has(v.video_id), onclick: () => {
+          const f = file.files[0], l = lang.value;  // read before plAct redraws the panel
+          plAct(v, () => setOriginal(v, "confirmed", f, l));
+        } }, "Confirm"),
         el("button", { class: "ghost", type: "button", onclick: () => { plConfirmOpen = null; renderPlaylist(); } }, "Cancel"));
     }
 
@@ -1352,6 +1414,7 @@
     async function generate(v) {
       try {
         await apiJson(`/api/youtube/videos/${v.video_id}/generate`, { method: "POST" });
+        plWatch.set(v.video_id, v.title);
         setMsg("plMsg", `Started “${v.title}”: downloading the original audio, then transcribing. This list updates by itself.`, "ok");
       } catch (e) { setMsg("plMsg", e.message, "err"); }
       await loadPlaylist();
