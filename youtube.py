@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 import re
-import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -50,15 +49,6 @@ def _noop(_msg: str) -> None:
 # --------------------------------------------------------------------------- #
 # Small parsers
 # --------------------------------------------------------------------------- #
-def playlist_id_from(value: str) -> str:
-    """Accept a bare playlist ID or any YouTube URL with ?list=..."""
-    value = (value or "").strip()
-    if "://" in value or value.startswith("www."):
-        query = urllib.parse.urlparse(value if "://" in value else "https://" + value).query
-        value = urllib.parse.parse_qs(query).get("list", [""])[0]
-    return value
-
-
 _DURATION_RE = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$")
 
 
@@ -107,8 +97,10 @@ def fetch_playlist(playlist_id: str, api_key: str) -> Dict[str, Any]:
     Quota: 1 unit per page of 50 for each of playlistItems.list and videos.list,
     plus 1 for the playlist title — about 13 units for 300 videos (10,000 a day).
     """
-    if not playlist_id or not api_key:
-        raise YouTubeError("Set YOUTUBE_API_KEY and YOUTUBE_PLAYLIST_ID.")
+    if not api_key:
+        raise YouTubeError("Set YOUTUBE_API_KEY.")
+    if not playlist_id:
+        raise YouTubeError("No playlist ID given.")
 
     meta = _api_get("playlists", {"part": "snippet", "id": playlist_id, "maxResults": 1}, api_key)
     if not meta.get("items"):

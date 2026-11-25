@@ -272,7 +272,7 @@
 
     <nav id="nav" class="nav hidden" aria-label="Sections">
       <button class="tab" data-nav="" type="button">Jobs</button>
-      <button class="tab" data-nav="youtube" type="button">YouTube playlist</button>
+      <button class="tab" data-nav="youtube" type="button">YouTube playlists</button>
       <input id="reviewerName" type="text" maxlength="100" autocomplete="name"
         placeholder="Your name (for approvals)" aria-label="Your name, recorded with approvals" />
     </nav>
@@ -424,6 +424,7 @@
 
     <!-- YOUTUBE PLAYLIST -->
     <div id="playlistView" class="hidden">
+      <div id="plTabs" class="tabs" role="tablist" aria-label="Playlists"></div>
       <section class="card">
         <div class="pl-head">
           <div>
@@ -504,10 +505,14 @@
     // (the app has one shared password, no accounts).
     const RKEY = "subtitle_reviewer";
     let reviewer = localStorage.getItem(RKEY) || "";
-    let pl = null;                                   // last GET /api/youtube/videos
+    const PLKEY = "subtitle_playlist";
+    let playlists = [];                              // [{key, label, playlist_id, url}] from /api/login, one tab each
+    let plKey = localStorage.getItem(PLKEY) || "";   // the open tab (remembered across visits)
+    let pl = null;                                   // last GET /api/youtube/videos of the open tab
     let plConfirmOpen = null, plUploadFor = null;    // video_id of an open "confirm original" panel / upload
     const plPending = new Set();  // video_ids with a request in flight: their buttons are disabled
-    const plWatch = new Map();    // video_id -> title of videos started here, to say when each is done
+    const plWatch = new Map();    // video_id -> {title, key} of videos started here, to say when each is done
+    const plSyncing = new Set();  // playlist keys with a sync in flight
     const YT_BUSY = new Set(["queued", "downloading", "transcribing", "translating"]);
     const CATEGORY = {
       not_started: { label: "Not started", badge: "" },
@@ -630,6 +635,7 @@
       if (!res.ok) return false;
       const data = await res.json();
       retentionHours = data.retention_hours || 168;
+      playlists = data.playlists || [];
       return true;
     }
     async function doLogin() {
@@ -664,11 +670,14 @@
     }
 
     // ---------- routing ----------
+    // #youtube/<key> is one playlist tab; plain #youtube opens the last one used.
+    const playlistHash = () => location.hash.match(/^#youtube(?:\/([\w-]+))?$/);
+    const onPlaylist = (key) => { const p = playlistHash(); return !!p && (!key || (p[1] || plKey) === key); };
     function route() {
-      const m = location.hash.match(/job=([0-9a-f]+)/);
-      if (m) openJob(m[1]); else if (location.hash === "#youtube") showPlaylist(); else showHome();
+      const m = location.hash.match(/job=([0-9a-f]+)/), p = !m && playlistHash();
+      if (m) openJob(m[1]); else if (p) showPlaylist(p[1]); else showHome();
       document.querySelectorAll("#nav .tab").forEach((t) => {
-        t.classList.toggle("active", !m && (t.dataset.nav === "youtube") === (location.hash === "#youtube"));
+        t.classList.toggle("active", !m && (t.dataset.nav === "youtube") === !!p);
       });
     }
     window.addEventListener("hashchange", () => { if (password) route(); });
@@ -823,7 +832,8 @@
         yt && yt.audio_track ? ` · audio: ${yt.audio_track}` : "",
         yt && yt.player_audio ? ` · player audio from YouTube: ${yt.player_audio} (the cues came from an uploaded file)` : "",
         job.audio_pending && !job.has_audio ? " · downloading the audio for the player…" : "");
-      $("backBtn").textContent = yt ? "← Playlist" : "← All jobs";
+      const ytList = yt && playlists.find((x) => x.key === yt.playlist);
+      $("backBtn").textContent = yt ? `← ${ytList ? ytList.label : "Playlist"}` : "← All jobs";
       const p = pill(job.state, job.error);
       if (yt && job.state === "transcribing") p.lastChild.textContent = " Downloading & transcribing";
       $("statusPill").replaceWith(p); p.id = "statusPill";
@@ -861,7 +871,7 @@
       syncPlayer();
       const hasSource = source.length > 0, hasReview = rows.length > 0;
       show("tabs", hasSource);
-      document.querySelectorAll(".tab").forEach((t) => {
+      document.querySelectorAll("#tabs .tab").forEach((t) => {
         t.classList.toggle("active", t.dataset.tab === activeTab);
         t.disabled = t.dataset.tab === "review" && !hasReview;
       });
@@ -947,7 +957,7 @@
       renderApprovals();
       renderTranslateButton();
     }
-    document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => { activeTab = t.dataset.tab; renderJob(); }));
+    document.querySelectorAll("#tabs .tab").forEach((t) => t.addEventListener("click", () => { activeTab = t.dataset.tab; renderJob(); }));
 
     // ---------- source editor ----------
     function markSourceDirty() { sourceDirty = true; setMsg("sourceMsg", "Unsaved changes.", ""); }
@@ -1205,21 +1215,50 @@
     }, () => { $("aiReviewBtn").disabled = !!(job && job.busy); }));
 
     // ---------- YouTube playlist dashboard ----------
-    async function showPlaylist() {
+    async function showPlaylist(key) {
       clearInterval(pollTimer);
       $("player").pause();
       job = null; sourceDirty = reviewDirty = false;
       show("homeView", false); show("jobView", false); show("playlistView");
       $("wrap").classList.add("wide");
       setMsg("plMsg", ""); plConfirmOpen = null;
+      const p = playlists.find((x) => x.key === key) || playlists.find((x) => x.key === plKey) || playlists[0];
+      if (!p) return $("plList").replaceChildren(el("p", { class: "msg err" }, "No playlists are configured."));
+      // Spell the tab out in the address (no hashchange, so no second route()).
+      if (location.hash !== "#youtube/" + p.key) history.replaceState(null, "", "#youtube/" + p.key);
+      if (p.key !== plKey || !pl || pl.playlist !== p.key) {
+        // Another tab: don't show the previous tab's videos under this one's name while loading.
+        pl = null;
+        $("plTitle").textContent = p.label;
+        $("plMeta").textContent = "";
+        $("plCounts").replaceChildren();
+        setMsg("plSyncErr", "");
+        $("plList").replaceChildren(el("p", { class: "empty" }, "Loading…"));
+        $("plFoot").textContent = "";
+      }
+      plKey = p.key;
+      localStorage.setItem(PLKEY, plKey);
+      renderPlTabs();
       await loadPlaylist();
     }
 
+    function renderPlTabs() {
+      $("plTabs").replaceChildren(...playlists.map((p) => el("button", {
+        class: "tab" + (p.key === plKey ? " active" : ""), type: "button", role: "tab",
+        "aria-selected": String(p.key === plKey), title: p.playlist_id,
+        onclick: () => { if (onPlaylist(p.key)) route(); else location.hash = "youtube/" + p.key; },
+      }, p.label)));
+      $("syncBtn").disabled = plSyncing.has(plKey);
+    }
+
+    const plLabel = (key) => (playlists.find((x) => x.key === key) || {}).label || key;
     const plBusy = () => !!pl && pl.videos.some((v) => v.busy || YT_BUSY.has(v.workflow_status));
 
     // Replace "Started …" with the outcome once a video started from this page has finished.
+    // Only videos of the open tab can be checked; the others are reported when their tab is opened.
     function plReportFinished() {
-      for (const [id, title] of plWatch) {
+      for (const [id, { title, key }] of plWatch) {
+        if (key !== pl.playlist) continue;
         const v = pl.videos.find((x) => x.video_id === id);
         if (v && v.category === "progress") continue;
         plWatch.delete(id);
@@ -1236,18 +1275,25 @@
       if (pl) renderPlaylist();
       try { await fn(); } finally {
         plPending.delete(v.video_id);
-        if (pl && location.hash === "#youtube") renderPlaylist();
+        if (pl && onPlaylist()) renderPlaylist();
       }
     }
 
+    // Loads the open tab. A response that comes back after the user has moved to another tab
+    // or page is dropped, so one playlist's videos never land under the other's tab.
     async function loadPlaylist() {
+      const key = plKey;
+      const url = "/api/youtube/videos?playlist=" + encodeURIComponent(key);
       try {
-        pl = await apiJson("/api/youtube/videos");
+        const data = await apiJson(url);
+        if (!onPlaylist(key)) return;
+        pl = data;
         plReportFinished();
         renderPlaylist();
       } catch (e) {
+        if (!onPlaylist(key)) return;
         pl = null;
-        $("plTitle").textContent = "YouTube playlist";
+        $("plTitle").textContent = plLabel(key);
         $("plMeta").textContent = "";
         $("plCounts").replaceChildren();
         $("plList").replaceChildren(el("p", { class: "msg err" }, e.message));
@@ -1256,9 +1302,11 @@
       clearInterval(pollTimer);
       if (plBusy()) {
         pollTimer = setInterval(async () => {
-          if (location.hash !== "#youtube") return clearInterval(pollTimer);
+          if (!onPlaylist(key)) return clearInterval(pollTimer);
           try {
-            pl = await apiJson("/api/youtube/videos");
+            const data = await apiJson(url);
+            if (!onPlaylist(key)) return;
+            pl = data;
             plReportFinished();
             if (!plConfirmOpen) renderPlaylist();  // don't wipe a half-filled confirm panel
             if (!plBusy()) clearInterval(pollTimer);
@@ -1268,7 +1316,8 @@
     }
 
     function renderPlaylist() {
-      const title = pl.playlist_title || "YouTube playlist";
+      renderPlTabs();
+      const title = pl.playlist_title || pl.playlist_label || "YouTube playlist";
       $("plTitle").replaceChildren(el("a", { href: pl.playlist_url, target: "_blank", rel: "noopener" }, title));
       const ls = pl.last_sync;
       $("plMeta").textContent = ls
@@ -1414,7 +1463,7 @@
     async function generate(v) {
       try {
         await apiJson(`/api/youtube/videos/${v.video_id}/generate`, { method: "POST" });
-        plWatch.set(v.video_id, v.title);
+        plWatch.set(v.video_id, { title: v.title, key: pl ? pl.playlist : plKey });
         setMsg("plMsg", `Started “${v.title}”: downloading the original audio, then transcribing. This list updates by itself.`, "ok");
       } catch (e) { setMsg("plMsg", e.message, "err"); }
       await loadPlaylist();
@@ -1456,16 +1505,22 @@
       xhr.send(fd);
     });
 
+    // Syncs the open tab. Its messages name the playlist, since the user may switch tabs meanwhile.
     $("syncBtn").addEventListener("click", async () => {
+      const key = plKey, label = plLabel(key);
+      if (plSyncing.has(key)) return;
+      plSyncing.add(key);
       $("syncBtn").disabled = true;
-      setMsg("plMsg", "Reading the playlist from YouTube…");
+      setMsg("plMsg", `Reading ${label} from YouTube…`);
       try {
-        const res = await apiJson("/api/youtube/sync", { method: "POST" });
-        setMsg("plMsg", `Synced ${res.total} videos: ${res.new.length ? `${res.new.length} new (${res.new.slice(0, 3).join(", ")}${res.new.length > 3 ? ", …" : ""})` : "nothing new"}`
+        const res = await apiJson("/api/youtube/sync?playlist=" + encodeURIComponent(key), { method: "POST" });
+        setMsg("plMsg", `${label}: synced ${res.total} videos: ${res.new.length ? `${res.new.length} new (${res.new.slice(0, 3).join(", ")}${res.new.length > 3 ? ", …" : ""})` : "nothing new"}`
           + (res.removed ? `, ${res.removed} no longer in the playlist` : "") + ".", "ok");
-      } catch (e) { setMsg("plMsg", e.message, "err"); }
-      $("syncBtn").disabled = false;
-      await loadPlaylist();
+      } catch (e) { setMsg("plMsg", `${label}: ${e.message}`, "err"); }
+      plSyncing.delete(key);
+      if (!onPlaylist()) return;
+      $("syncBtn").disabled = plSyncing.has(plKey);
+      if (plKey === key) await loadPlaylist();
     });
     ["plFilter", "plSort"].forEach((id) => $(id).addEventListener("change", () => { if (pl) renderPlaylist(); }));
     $("plSearch").addEventListener("input", () => { if (pl) renderPlaylist(); });
@@ -1481,8 +1536,10 @@
     }));
 
     // ---------- header actions ----------
+    // A playlist video goes back to its own tab (or the last one used, if the database didn't say).
+    const playlistHashFor = (yt) => (yt.playlist ? "youtube/" + yt.playlist : "youtube");
     $("backBtn").addEventListener("click", () => {
-      if (confirmLeave()) { sourceDirty = reviewDirty = false; location.hash = job && job.youtube ? "youtube" : ""; }
+      if (confirmLeave()) { sourceDirty = reviewDirty = false; location.hash = job && job.youtube ? playlistHashFor(job.youtube) : ""; }
     });
     $("deleteBtn").addEventListener("click", async () => {
       const yt = job.youtube;
@@ -1492,7 +1549,7 @@
       try {
         await apiJson(`/api/jobs/${job.id}`, { method: "DELETE" });
         sourceDirty = reviewDirty = false;
-        location.hash = yt ? "youtube" : "";
+        location.hash = yt ? playlistHashFor(yt) : "";
       } catch (e) { setMsg("jobMsg", e.message, "err"); }
     });
 

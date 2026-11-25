@@ -15,8 +15,8 @@ Workflow (one job per upload, human in the loop at every stage):
 Jobs live on disk under jobs/<id>/ and are deleted RETENTION_HOURS (default 168,
 i.e. 7 days) after creation.
 
-YouTube playlist dashboard (optional; needs DATABASE_URL, YOUTUBE_API_KEY and
-YOUTUBE_PLAYLIST_ID): videos of one playlist are tracked in Neon Postgres. A video
+YouTube playlist dashboard (optional; needs DATABASE_URL and YOUTUBE_API_KEY): the
+videos of the playlists in PLAYLISTS (one tab each) are tracked in Neon Postgres. A video
 gets a job like an upload does, but its audio is the original track downloaded
 from YouTube. Its jobs need two human approvals (Telugu, then English) before the
 video counts as completed, and their text is copied to the database after every
@@ -41,8 +41,9 @@ Endpoints:
     GET    /api/jobs/{id}/download/{kind}   -> telugu|english (?fmt=srt|sbv), workbook, brief, raw
     POST   /api/jobs/{id}/approve           -> approve Telugu or English (playlist videos only)
 
-    GET    /api/youtube/videos              -> playlist videos with status, counts, last sync
-    POST   /api/youtube/sync                -> re-read the playlist from the YouTube Data API
+    GET    /api/youtube/videos?playlist=k   -> playlist videos with status, counts, last sync
+    POST   /api/youtube/sync?playlist=k     -> re-read the playlist from the YouTube Data API
+                                               (k: a key in PLAYLISTS; omitted = the first)
     POST   /api/youtube/videos/{v}/generate -> download original audio, transcribe (also Retry)
     POST   /api/youtube/videos/{v}/original -> human decision on YouTube's captions (+ file)
     POST   /api/youtube/videos/{v}/open     -> the video's job, rebuilt from Neon if expired
@@ -96,16 +97,29 @@ RETENTION_HOURS = float(os.getenv("RETENTION_HOURS", "168"))  # 7 days
 CLEANUP_INTERVAL_SEC = 15 * 60
 
 # YouTube playlist dashboard (optional)
+# The playlists the dashboard tracks, one tab each, in tab order. `key` is what URLs use
+# (?playlist=ch3, #youtube/ch3); `playlist_id` is YouTube's ID (the `list=` of the playlist
+# URL; for a youtube.com/show/VLxxxx link, it is xxxx without the "VL"). A video belongs
+# to one playlist: if it ever appears in two, the playlist synced last shows it.
+# Add a playlist by appending a line; no database change is needed.
+PLAYLISTS = (
+    {"key": "ch3", "label": "Chapter 3", "playlist_id": "PLRL2WJ2yt-qNR4MzvFRiC_l3yaiaCz2wb"},
+    {"key": "ch4", "label": "Chapter 4", "playlist_id": "PLRL2WJ2yt-qNQK0CN9YI_wJydxeeVxFGL"},
+)
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-YOUTUBE_PLAYLIST_ID = youtube.playlist_id_from(os.getenv("YOUTUBE_PLAYLIST_ID", ""))
 YOUTUBE_AUDIO_LANG = os.getenv("YOUTUBE_AUDIO_LANG", "te").strip().lower()
 YOUTUBE_CONTEXT_HINT = os.getenv("YOUTUBE_CONTEXT_HINT", "").strip()[:1000]
 YOUTUBE_MAX_CONCURRENT = max(1, int(os.getenv("YOUTUBE_MAX_CONCURRENT", "1")))
 YOUTUBE_AUTO_SYNC_HOURS = float(os.getenv("YOUTUBE_AUTO_SYNC_HOURS", "0"))  # 0 = only the Sync button
 YT_SLOTS = threading.BoundedSemaphore(YOUTUBE_MAX_CONCURRENT)  # concurrent YouTube downloads
-_SYNC_LOCK = threading.Lock()
+_SYNC_LOCKS: Dict[str, threading.Lock] = {}  # playlist_id -> lock: one sync at a time per playlist
 _VIDEO_LOCKS: Dict[str, threading.Lock] = {}
 _VIDEO_LOCKS_GUARD = threading.Lock()
+
+
+def _sync_lock(playlist_id: str) -> threading.Lock:
+    with _VIDEO_LOCKS_GUARD:
+        return _SYNC_LOCKS.setdefault(playlist_id, threading.Lock())
 
 
 @contextmanager
@@ -416,7 +430,8 @@ def healthz() -> dict:
 
 @app.post("/api/login")
 def login(_: None = Depends(require_password)) -> dict:
-    return {"ok": True, "retention_hours": RETENTION_HOURS}
+    return {"ok": True, "retention_hours": RETENTION_HOURS,
+            "playlists": [{**p, "url": _playlist_url(p)} for p in PLAYLISTS]}
 
 
 @app.get("/api/jobs")
@@ -803,9 +818,27 @@ def _reviewer(raw: str) -> str:
 
 
 def _youtube_problem() -> Optional[str]:
-    if not YOUTUBE_API_KEY or not YOUTUBE_PLAYLIST_ID:
-        return "The playlist dashboard is not configured: set YOUTUBE_API_KEY and YOUTUBE_PLAYLIST_ID in .env."
+    if not YOUTUBE_API_KEY:
+        return "The playlist dashboard is not configured: set YOUTUBE_API_KEY in .env."
     return db.problem()
+
+
+def _playlist(key: Optional[str]) -> Dict[str, str]:
+    """The PLAYLISTS entry with this key; no key means the first one."""
+    if not key:
+        return PLAYLISTS[0]
+    found = next((p for p in PLAYLISTS if p["key"] == key), None)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Unknown playlist {key!r}.")
+    return found
+
+
+def _playlist_key(playlist_id: str) -> Optional[str]:
+    return next((p["key"] for p in PLAYLISTS if p["playlist_id"] == playlist_id), None)
+
+
+def _playlist_url(playlist: Dict[str, str]) -> str:
+    return f"https://www.youtube.com/playlist?list={playlist['playlist_id']}"
 
 
 def _require_youtube() -> None:
@@ -938,6 +971,7 @@ def _youtube_public(job: Job) -> Optional[dict]:
             current = video["current_job_id"] == job.id
             info.update({
                 "title": video["title"],
+                "playlist": _playlist_key(video["playlist_id"]),  # the dashboard tab to go back to
                 "current": current,
                 "workflow_status": (_workflow_status(job, video) if current else None) or video["workflow_status"],
                 **{k: _iso(video[k]) for k in ("telugu_approved_by", "telugu_approved_at",
@@ -1127,12 +1161,14 @@ def _video_public(video: Dict[str, Any], files: List[dict], last_ok: Optional[Di
     }
 
 
-def _run_sync(actor: str) -> dict:
-    run_id = db.start_sync(YOUTUBE_PLAYLIST_ID, actor)
+def _run_sync(playlist: Dict[str, str], actor: str) -> dict:
+    """Re-read one playlist. Call with _sync_lock(playlist_id) held."""
+    pid = playlist["playlist_id"]
+    run_id = db.start_sync(pid, actor)
     try:
-        data = youtube.fetch_playlist(YOUTUBE_PLAYLIST_ID, YOUTUBE_API_KEY)
-        new_ids = db.upsert_videos(YOUTUBE_PLAYLIST_ID, data["videos"])
-        removed = db.mark_removed(YOUTUBE_PLAYLIST_ID, [v["video_id"] for v in data["videos"]])
+        data = youtube.fetch_playlist(pid, YOUTUBE_API_KEY)
+        new_ids = db.upsert_videos(pid, data["videos"])
+        removed = db.mark_removed(pid, [v["video_id"] for v in data["videos"]])
         db.log_events(new_ids, "discovered", actor)
     except Exception as err:
         message = str(err) if isinstance(err, youtube.YouTubeError) else f"Sync failed ({type(err).__name__}: {err})"
@@ -1162,21 +1198,27 @@ def _reconcile_youtube() -> None:
 def _auto_sync_loop() -> None:
     while True:
         time.sleep(YOUTUBE_AUTO_SYNC_HOURS * 3600)
-        if _youtube_problem() or not _SYNC_LOCK.acquire(blocking=False):
+        if _youtube_problem():
             continue
-        try:
-            _run_sync("auto-sync")
-        except Exception as err:
-            _log(f"auto-sync failed: {getattr(err, 'detail', err)}")
-        finally:
-            _SYNC_LOCK.release()
+        for playlist in PLAYLISTS:
+            lock = _sync_lock(playlist["playlist_id"])
+            if not lock.acquire(blocking=False):
+                continue  # someone clicked Sync on this one just now
+            try:
+                _run_sync(playlist, "auto-sync")
+            except Exception as err:
+                _log(f"auto-sync of {playlist['label']} failed: {getattr(err, 'detail', err)}")
+            finally:
+                lock.release()
 
 
 @app.get("/api/youtube/videos")
-def youtube_videos(_: None = Depends(require_password)) -> dict:
+def youtube_videos(playlist: str = Query(""), _: None = Depends(require_password)) -> dict:
+    p = _playlist(playlist)
     _require_youtube()
+    pid = p["playlist_id"]
     files: Dict[str, List[dict]] = {}
-    current = db.current_subtitles(YOUTUBE_PLAYLIST_ID)
+    current = db.current_subtitles(pid)
     approved = {(f["video_id"], f["language"], f["format"]) for f in current if f["stage"] == "approved"}
     for f in current:
         # The latest generated draft is offered too, so subtitles can be found here before anyone
@@ -1187,12 +1229,14 @@ def youtube_videos(_: None = Depends(require_password)) -> dict:
             "source_type": f["source_type"], "stage": f["stage"], "language": f["language"],
             "format": f["format"], "version": f["version"], "created_by": f["created_by"],
             "created_at": _iso(f["created_at"])})
-    syncs = db.last_syncs(YOUTUBE_PLAYLIST_ID)
-    videos = [_video_public(v, files.get(v["video_id"], []), syncs["ok"]) for v in db.list_videos(YOUTUBE_PLAYLIST_ID)]
+    syncs = db.last_syncs(pid)
+    videos = [_video_public(v, files.get(v["video_id"], []), syncs["ok"]) for v in db.list_videos(pid)]
     latest, ok = syncs["latest"], syncs["ok"]
     return {
-        "playlist_id": YOUTUBE_PLAYLIST_ID,
-        "playlist_url": f"https://www.youtube.com/playlist?list={YOUTUBE_PLAYLIST_ID}",
+        "playlist": p["key"],
+        "playlist_label": p["label"],
+        "playlist_id": pid,
+        "playlist_url": _playlist_url(p),
         "playlist_title": (ok or {}).get("playlist_title"),
         "last_sync": None if not latest else {
             "started_at": _iso(latest["started_at"]), "error": latest["error"], "actor": latest["actor"],
@@ -1205,14 +1249,17 @@ def youtube_videos(_: None = Depends(require_password)) -> dict:
 
 
 @app.post("/api/youtube/sync")
-def youtube_sync(x_reviewer: str = Header(default=""), _: None = Depends(require_password)) -> dict:
+def youtube_sync(playlist: str = Query(""), x_reviewer: str = Header(default=""),
+                 _: None = Depends(require_password)) -> dict:
+    p = _playlist(playlist)
     _require_youtube()
-    if not _SYNC_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="A sync is already running.")
+    lock = _sync_lock(p["playlist_id"])
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=f"A sync of {p['label']} is already running.")
     try:
-        return _run_sync(_reviewer(x_reviewer) or "dashboard")
+        return _run_sync(p, _reviewer(x_reviewer) or "dashboard")
     finally:
-        _SYNC_LOCK.release()
+        lock.release()
 
 
 @app.post("/api/youtube/videos/{video_id}/generate")

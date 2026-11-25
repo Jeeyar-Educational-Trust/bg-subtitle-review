@@ -81,17 +81,6 @@ def test_parse_duration(iso, seconds):
     assert youtube.parse_duration(iso) == seconds
 
 
-@pytest.mark.parametrize("value, expected", [
-    ("PLabc123", "PLabc123"),
-    ("https://www.youtube.com/playlist?list=PLabc123", "PLabc123"),
-    ("https://www.youtube.com/watch?v=xyz&list=PLabc123&index=2", "PLabc123"),
-    ("www.youtube.com/playlist?list=PLabc123", "PLabc123"),
-    ("  PLabc123  ", "PLabc123"),
-])
-def test_playlist_id_from(value, expected):
-    assert youtube.playlist_id_from(value) == expected
-
-
 @pytest.mark.parametrize("message, expected", [
     ("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies", "refused the download"),
     ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "private"),

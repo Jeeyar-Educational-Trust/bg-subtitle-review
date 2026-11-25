@@ -207,8 +207,12 @@ speech-to-text).
 
 ## 4. YouTube playlist dashboard (optional)
 
-Instead of downloading and uploading each discourse by hand, the **YouTube playlist**
-tab tracks every video of one playlist and starts a job straight from YouTube.
+Instead of downloading and uploading each discourse by hand, the **YouTube playlists**
+page tracks every video of each playlist and starts a job straight from YouTube. Each
+playlist has its own tab (now **Chapter 3** and **Chapter 4**) with its own videos,
+counts and Sync button; the playlists are listed in `PLAYLISTS` at the top of `app.py`.
+To add one, append a line there (no database change is needed). For a
+`youtube.com/show/VLxxxx` link, the playlist ID is `xxxx` without the `VL`.
 
 1. **Sync latest videos** reads the playlist through the official YouTube Data API
    (an API key; public data only) and stores each video in Neon Postgres. New uploads
@@ -258,12 +262,14 @@ approvals, storage) works the same.
 
 ### Setup
 
-1. **Neon:** create a project and put both connection strings in `.env`:
-   `DATABASE_URL` (pooled, host contains `-pooler`) and `DATABASE_URL_UNPOOLED` (direct).
+1. **Neon:** create a project and put its pooled connection string in `.env` as
+   `DATABASE_URL` (Neon console → Connect, with connection pooling on; the host
+   contains `-pooler`). That is the only database setting: migrations need Neon's
+   direct host, which is the same string without `-pooler`, and work it out themselves.
 2. **Create the tables** (versioned migrations; run again whenever a release adds one):
 
    ```bash
-   alembic upgrade head      # uses DATABASE_URL_UNPOOLED
+   alembic upgrade head      # over the direct host, derived from DATABASE_URL
    alembic current           # shows the revision the database is at
    ```
 
@@ -271,8 +277,7 @@ approvals, storage) works the same.
    says "run `alembic upgrade head`" and the rest of the app keeps working. Try a new
    migration on a [Neon branch](https://neon.com/docs/introduction/branching) first.
 3. **YouTube Data API key:** Google Cloud console → enable *YouTube Data API v3* →
-   Credentials → API key, restricted to that API. Set `YOUTUBE_API_KEY` and
-   `YOUTUBE_PLAYLIST_ID` (the ID or the playlist URL).
+   Credentials → API key, restricted to that API. Set `YOUTUBE_API_KEY`.
 4. **Deno** (on the server): yt-dlp needs a JavaScript runtime for YouTube and uses
    Deno by default. On the VM, put `deno.exe` in a folder on the *system* PATH (the
    service runs as LocalSystem, not your user), then restart the service.

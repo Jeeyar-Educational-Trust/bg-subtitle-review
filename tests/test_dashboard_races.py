@@ -21,7 +21,7 @@ CUES = [{"start": 0.5, "end": 2.5, "text": "నమస్కారం", "confiden
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     for key, value in {"APP_PASSWORD": "pw", "DATABASE_URL": "", "YOUTUBE_API_KEY": "key",
-                       "YOUTUBE_PLAYLIST_ID": "PLtest", "JOBS_DIR": str(tmp_path / "jobs"),
+                       "JOBS_DIR": str(tmp_path / "jobs"),
                        "YOUTUBE_AUTO_SYNC_HOURS": "0", "YOUTUBE_MAX_CONCURRENT": "2"}.items():
         monkeypatch.setenv(key, value)  # DATABASE_URL="" keeps .env's real database out of reach
     for name in ("app", "db"):

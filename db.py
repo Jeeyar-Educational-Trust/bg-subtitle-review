@@ -3,14 +3,16 @@
 """
 db.py — Neon Postgres access for the YouTube playlist dashboard.
 
-The schema is owned by Alembic (migrations/), applied as a deploy step with
-`alembic upgrade head` over the direct (non-pooled) DATABASE_URL_UNPOOLED. The app
-never creates or alters tables: at startup it only checks that the database is at
-EXPECTED_REVISION, and turns the YouTube features off (503) until it is.
+One setting, DATABASE_URL: Neon's pooled connection string (host contains "-pooler").
+The app connects through it. Neon closes idle connections and scales to zero, so
+pooled connections are checked before use and the readiness check is retried while
+it fails.
 
-The app itself connects through Neon's pooled DATABASE_URL. Neon closes idle
-connections and scales to zero, so pooled connections are checked before use and
-the readiness check is retried while it fails.
+The schema is owned by Alembic (migrations/), applied as a deploy step with
+`alembic upgrade head`. Migrations run over Neon's direct host, which direct_url()
+derives from DATABASE_URL. The app never creates or alters tables: at startup it
+only checks that the database is at EXPECTED_REVISION, and turns the YouTube
+features off (503) until it is.
 
 Without DATABASE_URL the rest of the app works exactly as before.
 """
@@ -54,6 +56,22 @@ _state: Dict[str, Any] = {"ok": False, "error": "The database has not been check
 
 def configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
+
+
+def direct_url(url: str) -> str:
+    """Neon's direct (non-pooled) connection string for a pooled one.
+
+    Neon names the pooled host after the direct one plus "-pooler"
+    (ep-xxx-pooler.region.aws.neon.tech -> ep-xxx.region.aws.neon.tech), so the second
+    connection string never needs to be configured. Only the host is changed; a URL
+    without "-pooler" (already direct, or a local Postgres) is returned as it is.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    netloc, slash, tail = rest.partition("/")
+    userinfo, at, host = netloc.rpartition("@")  # a password may contain anything, even "-pooler."
+    return f"{scheme}://{userinfo}{at}{host.replace('-pooler.', '.', 1)}{slash}{tail}"
 
 
 def _get_pool():

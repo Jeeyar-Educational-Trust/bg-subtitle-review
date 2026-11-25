@@ -35,6 +35,11 @@ PLAYLIST = [
 ]
 EP4 = {"video_id": "vid4", "position": 3, "title": "Gita Ch 1 Ep 4", "published_at": "2026-01-22T00:00:00Z",
        "duration_sec": 1500, "thumbnail_url": None, "privacy_status": "unlisted", "yt_caption_flag": False}
+# The second tab's playlist; PLAYLIST above is the first tab's.
+CH4 = [{"video_id": "c4v1", "position": 0, "title": "Gita Ch 4 Ep 1", "published_at": "2026-02-01T00:00:00Z",
+        "duration_sec": 1400, "thumbnail_url": None, "privacy_status": "public", "yt_caption_flag": False}]
+TEST_PLAYLISTS = ({"key": "ch3", "label": "Chapter 3", "playlist_id": "PLtest"},
+                  {"key": "ch4", "label": "Chapter 4", "playlist_id": "PLtest4"})
 
 CUES = [{"start": 0.5, "end": 2.5, "text": "నమస్కారం", "confidence": 0.9, "review": None},
         {"start": 3.0, "end": 5.0, "text": "భగవద్గీత", "confidence": 0.8, "review": None}]
@@ -51,11 +56,10 @@ def env(tmp_path_factory):
         conn.execute("DROP SCHEMA public CASCADE")
         conn.execute("CREATE SCHEMA public")
     subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=ROOT, check=True,
-                   env={**os.environ, "DATABASE_URL_UNPOOLED": TEST_DB}, capture_output=True)
+                   env={**os.environ, "DATABASE_URL": TEST_DB}, capture_output=True)  # never .env's database
 
     mp = pytest.MonkeyPatch()
     for key, value in {"DATABASE_URL": TEST_DB, "APP_PASSWORD": "test-pw", "YOUTUBE_API_KEY": "key",
-                       "YOUTUBE_PLAYLIST_ID": "https://www.youtube.com/playlist?list=PLtest",
                        "JOBS_DIR": str(tmp_path_factory.mktemp("jobs")), "YOUTUBE_AUTO_SYNC_HOURS": "0"}.items():
         mp.setenv(key, value)
     for name in ("app", "db"):
@@ -65,8 +69,13 @@ def env(tmp_path_factory):
     state = {"playlist": list(PLAYLIST), "download_error": None, "downloads": []}
 
     def fake_fetch(playlist_id, api_key):
-        assert (playlist_id, api_key) == ("PLtest", "key")
+        assert api_key == "key"
+        if playlist_id == "PLtest4":
+            return {"playlist_title": "Bhagavad Gita Chapter 4", "videos": list(CH4), "skipped": 0}
+        assert playlist_id == "PLtest"
         return {"playlist_title": "Bhagavad Gita", "videos": list(state["playlist"]), "skipped": 0}
+
+    mp.setattr(app_module, "PLAYLISTS", TEST_PLAYLISTS)
 
     def fake_download(video_id, dest_dir, **kw):
         state["downloads"].append(video_id)
@@ -156,6 +165,21 @@ def test_sync_and_categories(env):
     assert data["last_sync"]["new_count"] == 1 and data["last_sync"]["actor"] == "Tester"
 
 
+def test_second_playlist_is_kept_apart(env):
+    client, _, _ = env
+    login = client.post("/api/login", headers=PW).json()
+    assert [p["key"] for p in login["playlists"]] == ["ch3", "ch4"]
+    res = client.post("/api/youtube/sync?playlist=ch4", headers=PW)
+    assert res.status_code == 200 and res.json()["new"] == ["Gita Ch 4 Ep 1"]
+    ch4 = client.get("/api/youtube/videos?playlist=ch4", headers=PW).json()
+    assert ch4["playlist"] == "ch4" and ch4["playlist_title"] == "Bhagavad Gita Chapter 4"
+    assert [v["video_id"] for v in ch4["videos"]] == ["c4v1"] and ch4["last_sync"]["total"] == 1
+    ch3 = videos(client)  # no ?playlist=: the first tab
+    assert ch3["playlist"] == "ch3" and [v["video_id"] for v in ch3["videos"]] == ["vid1", "vid2", "vid4"]
+    assert ch3["last_sync"]["total"] == 3  # its own last sync, not Chapter 4's
+    assert client.get("/api/youtube/videos?playlist=ch9", headers=PW).status_code == 404
+
+
 def test_generate_two_approvals_and_completion(env):
     client, app_module, state = env
     job = client.post("/api/youtube/videos/vid1/generate", headers=PW)
@@ -163,6 +187,7 @@ def test_generate_two_approvals_and_completion(env):
     job_id = job.json()["id"]
     job = wait_idle(client, job_id)
     assert job["state"] == "source" and job["youtube"]["workflow_status"] == "telugu_review"
+    assert job["youtube"]["playlist"] == "ch3"  # the job page's "← Chapter 3" goes back to this tab
     v = video(client, "vid1")
     assert v["category"] == "review" and v["audio_track"] == "140 · te · Telugu original"
     assert client.post("/api/youtube/videos/vid1/generate", headers=PW).status_code == 409  # already in review

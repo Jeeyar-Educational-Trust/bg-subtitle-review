@@ -1,7 +1,8 @@
 """Alembic environment: runs migrations over Neon's direct (non-pooled) connection.
 
 Neon recommends a direct connection for schema changes; the pooled "-pooler" host
-(DATABASE_URL, used by the app) runs PgBouncer in transaction mode.
+(DATABASE_URL, used by the app) runs PgBouncer in transaction mode. The direct
+string is derived from DATABASE_URL (db.direct_url), so there is only one setting.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, pool
 
+from db import direct_url  # the project root is on sys.path (alembic.ini: prepend_sys_path)
+
 load_dotenv()
 load_dotenv(".env.local")
 
@@ -25,13 +28,10 @@ target_metadata = None  # migrations are written by hand (plain SQL), not autoge
 
 
 def _url() -> str:
-    url = os.getenv("DATABASE_URL_UNPOOLED", "").strip()
+    url = os.getenv("DATABASE_URL", "").strip()
     if not url:
-        sys.exit("Set DATABASE_URL_UNPOOLED (Neon's direct connection string, the host without "
-                 "'-pooler') in .env before running migrations.")
-    if "-pooler." in url:
-        print("WARNING: DATABASE_URL_UNPOOLED points at a -pooler host; Neon recommends the "
-              "direct host for migrations.", file=sys.stderr)
+        sys.exit("Set DATABASE_URL (Neon's connection string) in .env before running migrations.")
+    url = direct_url(url)
     for prefix in ("postgresql://", "postgres://"):
         if url.startswith(prefix):
             return "postgresql+psycopg://" + url[len(prefix):]
