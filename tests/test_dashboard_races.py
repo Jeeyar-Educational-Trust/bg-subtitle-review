@@ -288,6 +288,39 @@ def test_save_says_english_is_stale_only_when_it_is(env):
     assert save(cues) is False  # back to the Telugu the English was made from
 
 
+def test_approval_refuses_text_the_reviewer_has_not_seen(env, monkeypatch):
+    app, state = env
+    job = generate(app, state)
+    approved = []
+    monkeypatch.setattr(app.db, "approve", lambda vid, lang, texts, job_id, reviewer: approved.append(lang))
+    approve = lambda stage, seen: app.approve_job(job.id, body={"stage": stage, "reviewer": "A", "seen": seen}, _=None)
+    telugu_page = lambda: [[c["start"], c["end"], c["text"]] for c in app.get_source(job.id, _=None)]
+
+    page_a = telugu_page()  # reviewer A opens the job
+    cues = app.get_source(job.id, _=None)  # reviewer B changes a cue and saves
+    cues[0]["text"] += " x"
+    app.save_source(job.id, cues=cues, x_reviewer="", _=None)
+    with pytest.raises(app.HTTPException) as err:
+        approve("telugu", page_a)  # A approves from the page loaded before B's edit
+    assert err.value.status_code == 409 and "Reload" in err.value.detail
+    with pytest.raises(app.HTTPException):
+        approve("telugu", None)  # a page from before this check sends nothing: refused too
+    assert approved == []
+    approve("telugu", telugu_page())  # after reloading
+    assert approved == ["te"]
+
+    state["videos"]["v1"]["telugu_approved_at"] = "2026-11-25T00:00:00Z"
+    translate(app, job)
+    wait_step(app, state, job.id)
+    page_a = [[r["cue"], r["english"], r["correction"]] for r in app.get_review(job.id, _=None)]
+    app.save_review(job.id, edits=[{"cue": 1, "correction": "Greetings"}], x_reviewer="", _=None)
+    with pytest.raises(app.HTTPException) as err:
+        approve("english", page_a)
+    assert err.value.status_code == 409
+    approve("english", [[r["cue"], r["english"], r["correction"]] for r in app.get_review(job.id, _=None)])
+    assert approved == ["te", "en"]
+
+
 def test_superseded_job_does_not_move_the_video(env):
     app, state = env
     job = generate(app, state)

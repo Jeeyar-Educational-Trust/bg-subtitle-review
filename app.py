@@ -133,6 +133,18 @@ def _video_lock(video_id: str):
     with lock:
         yield
 
+
+@contextmanager
+def _job_video_lock(job: "Job"):
+    """The video lock of a playlist job (nothing for other jobs). Saving an edit and approving
+    both take it, so an edit can never land between an approval's check and the approval."""
+    vid = job.options.get("youtube_video_id")
+    if not vid:
+        yield
+        return
+    with _video_lock(vid):
+        yield
+
 REVIEW_FLAGS = ("missing", "recovered", "low")  # see transcribe.build_cues
 
 SUBTITLE_EXTS = {".sbv", ".srt"}
@@ -596,13 +608,14 @@ def save_source(job_id: str, cues: Any = Body(...), x_reviewer: str = Header(def
     if job.state in BUSY_STATES:
         raise HTTPException(status_code=409, detail="Wait for the running step to finish before editing.")
     cleaned = _clean_cues(cues)
-    with _LOCK:
-        changed = _read_json(job.path("source.json"), []) != cleaned
-        _write_json(job.path("source.json"), cleaned)
-        job.cue_count = len(cleaned)
-        job.save()
-    if changed:  # an approved Telugu (and the English made from it) no longer matches
-        _after_edit(job, telugu=True, actor=_reviewer(x_reviewer))
+    with _job_video_lock(job):
+        with _LOCK:
+            changed = _read_json(job.path("source.json"), []) != cleaned
+            _write_json(job.path("source.json"), cleaned)
+            job.cue_count = len(cleaned)
+            job.save()
+        if changed:  # an approved Telugu (and the English made from it) no longer matches
+            _after_edit(job, telugu=True, actor=_reviewer(x_reviewer))
     _persist(job)
     return {"ok": True, "cue_count": len(cleaned), "translation_stale": _translation_stale(job)}
 
@@ -705,21 +718,22 @@ def save_review(job_id: str, edits: Any = Body(...), x_reviewer: str = Header(de
     if not isinstance(edits, list):
         raise HTTPException(status_code=400, detail="Expected a list of {cue, correction}.")
     changed = False
-    with _LOCK:
-        rows = _read_json(job.path("review.json"), [])
-        by_cue = {r["cue"]: r for r in rows}
-        for e in edits:
-            row = by_cue.get(e.get("cue")) if isinstance(e, dict) else None
-            if row is None:
-                raise HTTPException(status_code=400, detail=f"Unknown cue in edit: {e!r}")
-            correction = str(e.get("correction") or "").strip()
-            # A "correction" identical to the AI draft is no correction at all.
-            correction = "" if correction == row["english"] else correction
-            changed = changed or correction != (row.get("correction") or "")
-            row["correction"] = correction
-        _write_json(job.path("review.json"), rows)
-    if changed:  # an approved English no longer matches
-        _after_edit(job, telugu=False, actor=_reviewer(x_reviewer))
+    with _job_video_lock(job):
+        with _LOCK:
+            rows = _read_json(job.path("review.json"), [])
+            by_cue = {r["cue"]: r for r in rows}
+            for e in edits:
+                row = by_cue.get(e.get("cue")) if isinstance(e, dict) else None
+                if row is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown cue in edit: {e!r}")
+                correction = str(e.get("correction") or "").strip()
+                # A "correction" identical to the AI draft is no correction at all.
+                correction = "" if correction == row["english"] else correction
+                changed = changed or correction != (row.get("correction") or "")
+                row["correction"] = correction
+            _write_json(job.path("review.json"), rows)
+        if changed:  # an approved English no longer matches
+            _after_edit(job, telugu=False, actor=_reviewer(x_reviewer))
     _persist(job)
     return {"ok": True, "corrected": sum(1 for r in rows if r["correction"])}
 
@@ -1014,6 +1028,7 @@ def _link_job(job: Job, video: Dict[str, Any], status: str, audio_track: Optiona
                         last_error=None, audio_track=audio_track,
                         telugu_approved_by=None, telugu_approved_at=None,
                         english_approved_by=None, english_approved_at=None)
+        db.retire_approved(conn, video["video_id"], db.LANGUAGES)  # the old job's files are history now
         db.log_event(video["video_id"], "generate" if audio_track is None else "upload", actor,
                      {"job_id": job.id, "audio_track": audio_track}, conn=conn)
 
@@ -1377,43 +1392,66 @@ def youtube_subtitle(
                     headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
+def _telugu_seen(items: List[Dict[str, Any]]) -> List[list]:
+    """What a reviewer approves on the Telugu tab: each cue's times and text."""
+    return [[c["start"], c["end"], c["text"]] for c in items]
+
+
+def _english_seen(rows: List[Dict[str, Any]]) -> List[list]:
+    """What a reviewer approves on the English tab: each cue's AI draft and correction."""
+    return [[r["cue"], r["english"], r.get("correction") or ""] for r in rows]
+
+
+def _require_seen(body: Dict[str, Any], saved: List[list], what: str) -> None:
+    if body.get("seen") != saved:
+        raise HTTPException(status_code=409, detail=f"The {what} was changed after you opened this page "
+                            "(someone else saved an edit, or the page is out of date). Reload the page and "
+                            "check the changes before approving.")
+
+
 @app.post("/api/jobs/{job_id}/approve")
 def approve_job(job_id: str, body: Dict[str, Any] = Body(...), _: None = Depends(require_password)) -> dict:
-    """Approve Telugu (unlocks translation) or English (completes the video). Playlist videos only."""
+    """Approve Telugu (unlocks translation) or English (completes the video). Playlist videos only.
+
+    `seen` is the text on the reviewer's page (see _telugu_seen / _english_seen). It must match
+    what is saved, so nobody approves an edit someone else made after their page was loaded."""
     job = get_job(job_id)
     vid = _video_id(job)
     if not vid:
         raise HTTPException(status_code=400, detail="Only jobs of playlist videos have approvals.")
     _require_youtube()
-    if job.state in BUSY_STATES:
-        raise HTTPException(status_code=409, detail="Wait for the running step to finish.")
     stage, reviewer = body.get("stage"), str(body.get("reviewer") or "").strip()[:100]
     if not reviewer:
         raise HTTPException(status_code=400, detail="Type your name before approving.")
-    video = db.get_video(vid)
-    if not video or video["current_job_id"] != job.id:
-        raise HTTPException(status_code=409, detail="This job is no longer the video's current job.")
-    if stage == "telugu":
-        items = _read_json(job.path("source.json"))
-        if not items:
-            raise HTTPException(status_code=409, detail="There are no Telugu cues to approve yet.")
-        blank = sum(1 for c in items if not c["text"])
-        if blank:
-            raise HTTPException(status_code=409, detail=f"{blank} cue(s) have no text yet. Type their words "
-                                                        "or delete them before approving.")
-        db.approve(vid, "te", {fmt: _telugu_text(items, fmt) for fmt in FORMATS}, job.id, reviewer)
-    elif stage == "english":
-        if not video["telugu_approved_at"]:
-            raise HTTPException(status_code=409, detail="Approve the Telugu subtitles first.")
-        rows = _read_json(job.path("review.json"))
-        if not rows:
-            raise HTTPException(status_code=409, detail="Translate to English first.")
-        if not _english_fresh(job):
-            raise HTTPException(status_code=409, detail="The English was translated from an earlier version of "
-                                                        "the Telugu. Re-translate before approving.")
-        db.approve(vid, "en", {fmt: pipeline.english_subtitles(rows, fmt) for fmt in FORMATS}, job.id, reviewer)
-    else:
-        raise HTTPException(status_code=400, detail="stage must be telugu or english.")
+    with _video_lock(vid):  # no edit can be saved between the checks below and the approval
+        if job.state in BUSY_STATES:
+            raise HTTPException(status_code=409, detail="Wait for the running step to finish.")
+        video = db.get_video(vid)
+        if not video or video["current_job_id"] != job.id:
+            raise HTTPException(status_code=409, detail="This job is no longer the video's current job.")
+        if stage == "telugu":
+            items = _read_json(job.path("source.json"))
+            if not items:
+                raise HTTPException(status_code=409, detail="There are no Telugu cues to approve yet.")
+            blank = sum(1 for c in items if not c["text"])
+            if blank:
+                raise HTTPException(status_code=409, detail=f"{blank} cue(s) have no text yet. Type their words "
+                                                            "or delete them before approving.")
+            _require_seen(body, _telugu_seen(items), "Telugu")
+            db.approve(vid, "te", {fmt: _telugu_text(items, fmt) for fmt in FORMATS}, job.id, reviewer)
+        elif stage == "english":
+            if not video["telugu_approved_at"]:
+                raise HTTPException(status_code=409, detail="Approve the Telugu subtitles first.")
+            rows = _read_json(job.path("review.json"))
+            if not rows:
+                raise HTTPException(status_code=409, detail="Translate to English first.")
+            if not _english_fresh(job):
+                raise HTTPException(status_code=409, detail="The English was translated from an earlier version of "
+                                                            "the Telugu. Re-translate before approving.")
+            _require_seen(body, _english_seen(rows), "English")
+            db.approve(vid, "en", {fmt: pipeline.english_subtitles(rows, fmt) for fmt in FORMATS}, job.id, reviewer)
+        else:
+            raise HTTPException(status_code=400, detail="stage must be telugu or english.")
     _persist(job)
     return job.public()
 

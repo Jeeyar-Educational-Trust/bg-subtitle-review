@@ -56,7 +56,7 @@ WORKBOOK_COLUMNS = [
     "Cue Number",
     "Timecode",
     "Telugu Cue",
-    "Human Review Correction",   # the final English: the human correction, else the AI draft
+    "Final English",             # the human correction, else the AI draft
     "AI Generated English Cue",
 ]
 

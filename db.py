@@ -397,21 +397,34 @@ def approve(video_id: str, language: str, texts: Dict[str, str], job_id: str, re
         log_event(video_id, f"approve_{col}", reviewer, {"job_id": job_id, "versions": versions}, conn=conn)
 
 
+def retire_approved(conn: Any, video_id: str, languages: Sequence[str]) -> None:
+    """Stop offering a withdrawn approval's files for download. They stay in subtitle_files as
+    history (not current), like an undone original, so the dashboard offers the current draft
+    again instead of an "approved" file that no longer matches the text."""
+    conn.execute(
+        "UPDATE subtitle_files SET is_current = FALSE WHERE video_id = %s AND source_type = 'generated' "
+        "AND stage = 'approved' AND language = ANY(%s) AND is_current", (video_id, list(languages)))
+
+
 def clear_approvals(video_id: str, *, telugu: bool, english: bool, actor: Optional[str], reason: str) -> bool:
-    """Drop approvals after an edit. Approved versions stay in subtitle_files as history."""
-    sets, conds = [], []
+    """Drop approvals after an edit. Approved versions stay in subtitle_files as history,
+    but are no longer offered for download."""
+    sets, conds, languages = [], [], []
     if telugu:
         sets += ["telugu_approved_by = NULL", "telugu_approved_at = NULL"]
         conds.append("telugu_approved_at IS NOT NULL")
+        languages.append("te")
     if english:
         sets += ["english_approved_by = NULL", "english_approved_at = NULL"]
         conds.append("english_approved_at IS NOT NULL")
+        languages.append("en")
     if not sets:
         return False
     with transaction() as conn:
         cur = conn.execute(
             f"UPDATE youtube_videos SET {', '.join(sets)}, updated_at = now() "
             f"WHERE video_id = %s AND ({' OR '.join(conds)})", (video_id,))
+        retire_approved(conn, video_id, languages)
         if cur.rowcount:
             log_event(video_id, "approval_cleared", actor,
                       {"telugu": telugu, "english": english, "reason": reason}, conn=conn)

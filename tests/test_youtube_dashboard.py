@@ -140,6 +140,16 @@ def video(client, vid):
     return next(v for v in videos(client)["videos"] if v["video_id"] == vid)
 
 
+def approve(client, job_id, stage, reviewer):
+    """Approve as the job page does: with the text the page shows."""
+    res = client.get(f"/api/jobs/{job_id}/{'source' if stage == 'telugu' else 'review'}", headers=PW)
+    items = res.json() if res.status_code == 200 else []
+    seen = ([[c["start"], c["end"], c["text"]] for c in items] if stage == "telugu"
+            else [[r["cue"], r["english"], r.get("correction") or ""] for r in items])
+    return client.post(f"/api/jobs/{job_id}/approve", json={"stage": stage, "reviewer": reviewer, "seen": seen},
+                       headers=PW)
+
+
 def test_requires_password(env):
     client, _, _ = env
     assert client.get("/api/youtube/videos").status_code == 401
@@ -197,7 +207,7 @@ def test_generate_two_approvals_and_completion(env):
     assert client.post(f"/api/jobs/{job_id}/approve", json={"stage": "telugu"}, headers=PW).status_code == 400
     assert client.post(f"/api/jobs/{job_id}/approve", json={"stage": "english", "reviewer": "A"},
                        headers=PW).status_code == 409
-    res = client.post(f"/api/jobs/{job_id}/approve", json={"stage": "telugu", "reviewer": "Asha"}, headers=PW)
+    res = approve(client, job_id, "telugu", "Asha")
     assert res.status_code == 200 and res.json()["youtube"]["telugu_approved_by"] == "Asha"
     assert video(client, "vid1")["workflow_status"] == "telugu_approved"
 
@@ -206,7 +216,7 @@ def test_generate_two_approvals_and_completion(env):
     assert job["state"] == "review" and job["youtube"]["english_fresh"]
     assert video(client, "vid1")["workflow_status"] == "english_review"
 
-    res = client.post(f"/api/jobs/{job_id}/approve", json={"stage": "english", "reviewer": "Ravi"}, headers=PW)
+    res = approve(client, job_id, "english", "Ravi")
     assert res.status_code == 200
     v = video(client, "vid1")
     assert v["workflow_status"] == "completed" and v["category"] == "generated"
@@ -232,7 +242,11 @@ def test_edits_withdraw_approvals_and_keep_history(env):
     v = video(client, "vid1")
     assert v["workflow_status"] == "english_review" and v["english_approved_by"] is None
     assert v["telugu_approved_by"] == "Asha"
-    client.post(f"/api/jobs/{job_id}/approve", json={"stage": "english", "reviewer": "Ravi"}, headers=PW)
+    # The withdrawn English is no longer offered as "approved"; the edited draft is.
+    offered = {(f["language"], f["format"]): f["stage"] for f in v["files"]}
+    assert offered[("en", "srt")] == "draft" and offered[("te", "srt")] == "approved"
+    assert client.get("/api/youtube/videos/vid1/subtitles?lang=en&fmt=srt", headers=PW).status_code == 404
+    approve(client, job_id, "english", "Ravi")
     v = video(client, "vid1")
     assert v["workflow_status"] == "completed"
     assert {(f["language"], f["format"]): f["version"] for f in v["files"]}[("en", "srt")] == 2
@@ -244,16 +258,19 @@ def test_edits_withdraw_approvals_and_keep_history(env):
     assert client.put(f"/api/jobs/{job_id}/source", json=source, headers=PW).status_code == 200
     v = video(client, "vid1")
     assert v["workflow_status"] == "telugu_review" and v["telugu_approved_by"] is None
-    client.post(f"/api/jobs/{job_id}/approve", json={"stage": "telugu", "reviewer": "Asha"}, headers=PW)
+    approve(client, job_id, "telugu", "Asha")
     assert video(client, "vid1")["workflow_status"] == "telugu_approved"  # English must be re-translated
-    res = client.post(f"/api/jobs/{job_id}/approve", json={"stage": "english", "reviewer": "Ravi"}, headers=PW)
+    res = approve(client, job_id, "english", "Ravi")
     assert res.status_code == 409 and "Re-translate" in res.json()["detail"]
+    # The new Telugu is offered as approved; the English made from the old Telugu is not.
+    offered = {(f["language"], f["format"]): (f["stage"], f["version"]) for f in video(client, "vid1")["files"]}
+    assert offered[("te", "srt")] == ("approved", 2) and offered[("en", "srt")][0] == "draft"
 
     rows = app_module.db.fetchall(
         "SELECT language, format, stage, version, is_current FROM subtitle_files WHERE video_id = 'vid1' "
         "AND stage = 'approved' ORDER BY language, format, version")
     assert [(r["language"], r["format"], r["version"], r["is_current"]) for r in rows if r["format"] == "srt"] == [
-        ("en", "srt", 1, False), ("en", "srt", 2, True), ("te", "srt", 1, False), ("te", "srt", 2, True)]
+        ("en", "srt", 1, False), ("en", "srt", 2, False), ("te", "srt", 1, False), ("te", "srt", 2, True)]
     events = [r["event"] for r in app_module.db.fetchall(
         "SELECT event FROM video_events WHERE video_id = 'vid1' ORDER BY id")]
     assert events.count("approval_cleared") == 2 and "approve_telugu" in events and "generate" in events

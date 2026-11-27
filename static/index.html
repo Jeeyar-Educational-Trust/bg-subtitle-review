@@ -938,9 +938,14 @@
         ? `Approve the Telugu subtitles as reviewed, as ${reviewer}?`
         : `Give the final approval to the English subtitles, as ${reviewer}? The video then counts as completed.`;
       if (!confirm(question)) return;
+      // Exactly what this page shows. The server refuses the approval if the saved text differs,
+      // e.g. someone else saved an edit after this page was loaded.
+      const seen = stage === "telugu"
+        ? source.map((c) => [c.start, c.end, c.text])
+        : rows.map((r) => [r.cue, r.english, r.correction || ""]);
       try {
         job = await apiJson(`/api/jobs/${job.id}/approve`, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage, reviewer }),
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage, reviewer, seen }),
         });
         renderJob();
         const done = stage === "english" ? "English approved. This video is complete."

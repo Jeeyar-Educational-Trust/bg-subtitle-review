@@ -18,7 +18,7 @@ The workbook must contain exactly these columns:
 - Cue Number
 - Timecode
 - Telugu Cue
-- Human Review Correction
+- Final English
 - AI Generated English Cue
 
 ## Source of Truth
